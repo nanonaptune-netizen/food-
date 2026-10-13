@@ -6,7 +6,7 @@ import { VoiceInteraction, UserProfile } from '../types';
 import ParticleBall from './ParticleBall';
 import { RenderedMarkdown } from './RenderedMarkdown';
 import { transcribeAudioInBrowser } from '../lib/clientWhisper';
-import { stripEmojis } from '../utils/text';
+import { stripEmojis, cleanSpeechTranscript, mergeTranscripts } from '../utils/text';
 
 function isHallucinatedText(text: string): boolean {
   if (!text || !text.trim()) return true;
@@ -62,6 +62,7 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const transcriptRef = useRef<string>('');
+  const accumulatedFinalRef = useRef<string>('');
   const sessionPrefixRef = useRef<string>('');
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
   const silenceTimerRef = useRef<any>(null);
@@ -71,6 +72,8 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
   const vadIntervalRef = useRef<any>(null);
   const hasSpokenRef = useRef<boolean>(false);
   const lastSoundTimeRef = useRef<number>(0);
+  // High-performance response cache for repeated queries
+  const queryCacheRef = useRef<Map<string, { response: string; spokenText: string; audioUrl?: string; isComplaintDraft?: boolean; markdownReport?: string }>>(new Map());
 
   const updateListeningState = (val: boolean) => {
     isListeningRef.current = val;
@@ -322,28 +325,33 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
         };
 
         recognition.onresult = (event: any) => {
-          let finalTranscript = '';
-          let interimTranscript = '';
+          let currentFinal = '';
+          let currentInterim = '';
           
-          for (let i = 0; i < event.results.length; ++i) {
-            if (event.results[i].isFinal) {
-              finalTranscript += event.results[i][0].transcript;
-            } else {
-              interimTranscript += event.results[i][0].transcript;
+          for (let i = event.resultIndex; i < event.results.length; ++i) {
+            const item = event.results[i];
+            if (item && item[0]) {
+              if (item.isFinal) {
+                currentFinal += item[0].transcript + ' ';
+              } else {
+                currentInterim += item[0].transcript;
+              }
             }
           }
 
-          const fullText = (finalTranscript + interimTranscript);
-          
-          // Deduplicate consecutive repeated words across languages
-          const cleanText = (sessionPrefixRef.current + " " + fullText)
-            .replace(/\b(\w+)(?:\s+\1\b)+/gi, '$1')
-            .replace(/([\u0900-\u0D7F]+)(?:\s+\1)+/gu, '$1')
-            .trim();
+          if (currentFinal) {
+            const cleanFinal = currentFinal.trim();
+            // Prevent duplicate appending of the exact same recognized chunk
+            if (!accumulatedFinalRef.current.includes(cleanFinal)) {
+              accumulatedFinalRef.current = cleanSpeechTranscript((accumulatedFinalRef.current + ' ' + cleanFinal).trim());
+            }
+          }
 
-          if (cleanText) {
-            transcriptRef.current = cleanText;
-            setTranscript(cleanText);
+          const combined = cleanSpeechTranscript((accumulatedFinalRef.current + ' ' + currentInterim).trim());
+
+          if (combined) {
+            transcriptRef.current = combined;
+            setTranscript(combined);
             hasSpokenRef.current = true;
             lastSoundTimeRef.current = Date.now();
 
@@ -352,7 +360,7 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
               stopSpeaking();
             }
 
-            // Silence Detection: After 2.0s of silence after speech, auto send!
+            // Silence Detection: After natural pause (3.5 seconds of silence) after speech, auto send
             if (silenceTimerRef.current) {
               clearTimeout(silenceTimerRef.current);
             }
@@ -368,18 +376,13 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
           console.warn('Browser speech recognition notice:', event.error);
           if (event.error === 'not-allowed') {
             setMicError("Microphone access blocked in browser. Please enable permissions.");
+            updateListeningState(false);
           }
         };
 
         recognition.onend = async () => {
           if (isListeningRef.current) {
-            // Chrome abruptly ends recognition when it detects a long pause or no speech.
-            // DO NOT automatically send just because onend fired; instead, accumulate and restart.
-            // Auto-send ONLY occurs if the 3500ms silenceTimer fires.
-            const capturedText = transcriptRef.current?.trim();
-            if (capturedText) {
-              sessionPrefixRef.current = capturedText + " ";
-            }
+            // Keep speech recognition continuously running while user is in active speaking mode
             try {
               recognition.start();
             } catch {}
@@ -419,7 +422,7 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
       }
 
       utterance.lang = targetLangCode;
-      utterance.rate = 1.4; // 1.4X speed as requested
+      utterance.rate = 1.35; // Authentic clear cadence
       utterance.pitch = 1.0;
 
       // Find best available voice on the device (prioritize Google keyboard / Android / native voice)
@@ -429,15 +432,25 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
 
       const lowerPrefix = langPrefix.toLowerCase();
       
-      // 1. Google voice specifically for language (e.g. Google ಕನ್ನಡ, Google हिन्दी, Google English)
+      // Priority 1: Microsoft Edge Natural Voice (e.g. Microsoft Gagan/Sapna - Kannada, Swara/Madhur - Hindi, Neerja/Prabhat - English)
       let matchedVoice = availableVoices.find(v => {
         const vLang = v.lang.toLowerCase().replace('_', '-');
         const vName = v.name.toLowerCase();
-        return (vLang.startsWith(lowerPrefix) || vName.includes(lang.toLowerCase())) && 
-               (vName.includes('google') || vName.includes('natural'));
+        const matchesLang = vLang.startsWith(lowerPrefix) || vName.includes(lowerPrefix) || vName.includes(lang.toLowerCase());
+        return matchesLang && (vName.includes('microsoft') || vName.includes('edge') || vName.includes('natural'));
       });
 
-      // 2. Any voice matching language prefix (kn, hi, en)
+      // Priority 2: Google / Chrome voices for language
+      if (!matchedVoice) {
+        matchedVoice = availableVoices.find(v => {
+          const vLang = v.lang.toLowerCase().replace('_', '-');
+          const vName = v.name.toLowerCase();
+          const matchesLang = vLang.startsWith(lowerPrefix) || vName.includes(lowerPrefix) || vName.includes(lang.toLowerCase());
+          return matchesLang && vName.includes('google');
+        });
+      }
+
+      // Priority 3: Any voice matching language prefix (kn, hi, en)
       if (!matchedVoice) {
         matchedVoice = availableVoices.find(v => {
           const vLang = v.lang.toLowerCase().replace('_', '-');
@@ -446,9 +459,9 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
         });
       }
 
-      // If user selected Kannada or Hindi, but this browser has zero matching TTS voices installed:
-      // Return false so we can smoothly fall back to server/audioUrl TTS without silence or error!
-      if ((lang === 'Kannada' || lang === 'Hindi') && !matchedVoice) {
+      // If requested language is Kannada or Hindi and device does NOT have a native voice for it,
+      // return false so the assistant immediately uses the server neural voice (audioUrl / /api/tts)
+      if ((langPrefix === 'kn' || langPrefix === 'hi') && !matchedVoice) {
         return false;
       }
 
@@ -474,7 +487,7 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
       window.speechSynthesis.speak(utterance);
       return true;
     } catch (e) {
-      console.warn("Browser speech synthesis notice:", e);
+      console.warn("Browser SpeechSynthesis attempt notice:", e);
       return false;
     }
   };
@@ -574,6 +587,7 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     }
 
     const browserCaptured = transcriptRef.current.trim();
+    accumulatedFinalRef.current = '';
     
     // 1ST PRIORITY: Free native Browser Web Speech API (Chrome/Edge/Safari/Android/Kotlin-like)
     if (browserCaptured && !isHallucinatedText(browserCaptured)) {
@@ -614,6 +628,7 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     }
     setTranscript('');
     transcriptRef.current = '';
+    accumulatedFinalRef.current = '';
     sessionPrefixRef.current = '';
     updateListeningState(true);
     
@@ -708,6 +723,31 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
 
     const userTurnCount = messages.filter(m => m.sender === 'user').length + 1;
 
+    // Check local response cache for immediate fast return on repeated queries
+    const cacheKey = `${language}:${queryText.toLowerCase().trim()}`;
+    const cachedResponse = queryCacheRef.current.get(cacheKey);
+    if (cachedResponse && !complaintDraft) {
+      const assistantMsg: VoiceInteraction = { 
+        id: (Date.now() + 1).toString(), 
+        text: cachedResponse.response, 
+        sender: 'assistant', 
+        timestamp: Date.now(),
+        audioUrl: cachedResponse.audioUrl
+      };
+      setMessages(prev => [...prev, assistantMsg]);
+      speak(cachedResponse.spokenText || cachedResponse.response, cachedResponse.audioUrl, assistantMsg.id);
+      if (cachedResponse.isComplaintDraft) {
+        setComplaintDraft({
+          query: queryText,
+          markdownReport: cachedResponse.markdownReport || cachedResponse.response,
+          media: []
+        });
+      }
+      setIsLoading(false);
+      setTranscript('');
+      return;
+    }
+
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -735,6 +775,16 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
       
       const assistantReply = data.response || "I have received your query. How else may I assist you?";
       const spokenVoiceText = data.spokenText || assistantReply;
+
+      // Store in memory cache
+      queryCacheRef.current.set(cacheKey, {
+        response: assistantReply,
+        spokenText: spokenVoiceText,
+        audioUrl: data.audioUrl || undefined,
+        isComplaintDraft: !!data.isComplaintDraft,
+        markdownReport: data.markdownReport
+      });
+
       const assistantMsg: VoiceInteraction = { 
         id: (Date.now() + 1).toString(), 
         text: assistantReply, 

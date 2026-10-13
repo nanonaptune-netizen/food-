@@ -3,18 +3,31 @@ import {
   Phone, 
   PhoneOff, 
   Mic, 
+  MicOff,
   Volume2, 
   VolumeX, 
-  ArrowLeft,
-  RotateCcw
+  ArrowLeft
 } from 'lucide-react';
 import { UserProfile } from '../types';
 import { Link } from 'react-router-dom';
 import { stripEmojis } from '../utils/text';
+import { VoiceCapture, VoiceLang } from '../lib/voiceCapture';
 
 interface IVRDialerProps {
   profile?: UserProfile;
 }
+
+// Domain hint passed to the STT engine so Kannada/Hindi words such as
+// "ನಮಸ್ಕಾರ" / "ನಮಸ್ಕಾರ" (namaskara) and local hotel names are recognised
+// correctly instead of being guessed as English.
+const IVR_STT_HINTS: Record<VoiceLang, string> = {
+  'kn-IN':
+    'ನಮಸ್ಕಾರ, ಆಹಾರ ಸುರಕ್ಷತೆ, ದೂರು, ಹೋಟೆಲ್, ರೆಸ್ಟೋರೆಂಟ್, ಇಡ್ಲಿ, ದೋಸೆ, ಅನ್ನ, ಉಪ್ಪು ಜಾಸ್ತಿ, ಹುಳು, ಕೂದಲು, ಕಲುಷಿತ, ಹಾಳಾಗಿದೆ, ನಿನ್ನೆ, ಇಂದು, ದಯವಿಟ್ಟು.',
+  'hi-IN':
+    'नमस्ते, खाद्य सुरक्षा, शिकायत, होटल, रेस्टोरेंट, इडली, डोसा, चावल, नमक ज्यादा, कीड़ा, बाल, खराब, कल, आज, कृपया।',
+  'en-IN':
+    'Namaskara, food safety, complaint, hotel, restaurant, idli, dosa, rice, excess salt, insect, hair, spoiled, yesterday, today, please.',
+};
 
 // DTMF Frequencies for authentic telephone tones
 const DTMF_FREQS: Record<string, [number, number]> = {
@@ -36,6 +49,7 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
   // Call States
   const [callActive, setCallActive] = useState<boolean>(false);
   const [callDuration, setCallDuration] = useState<number>(0);
+  const callActiveRef = useRef<boolean>(false);
 
   // IVR Dialogue State
   const [ivrStep, setIvrStep] = useState<string>('welcome');
@@ -45,6 +59,9 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
   const [statusMessage, setStatusMessage] = useState<string>('Press Start Call to begin');
   const [lastCallerSpoken, setLastCallerSpoken] = useState<string>('');
   const [lastIvrResponse, setLastIvrResponse] = useState<string>('');
+  const [callerSpeaking, setCallerSpeaking] = useState<boolean>(false);
+  const [micLevel, setMicLevel] = useState<number>(0);
+  const [notice, setNotice] = useState<string>('');
 
   // Voice Note Recording (Press 7 Feature)
   const [isBeepPlaying, setIsBeepPlaying] = useState<boolean>(false);
@@ -58,6 +75,7 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
     location?: string;
     item?: string;
     audioNoteUrl?: string;
+    language?: string;
   }>({});
 
   // Audio & WebRTC Refs
@@ -65,17 +83,45 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
-  const speechRecognitionRef = useRef<any>(null);
   const callTimerRef = useRef<any>(null);
   const noteTimerRef = useRef<any>(null);
 
-  // Silence / Inactivity Timers (20s first warning, then 10s goodbye)
-  const silence20TimerRef = useRef<any>(null);
-  const silence10TimerRef = useRef<any>(null);
-  const speechSilenceTimerRef = useRef<any>(null);
-  const greetingCancelRef = useRef<boolean>(false);
+  // Persistent voice capture engine (mic + VAD + single-shot transcription)
+  const voiceEngineRef = useRef<VoiceCapture | null>(null);
+
+  // Conversation bookkeeping so every call is persisted with its full transcript
+  const callIdRef = useRef<string>('');
+  const turnIndexRef = useRef<number>(0);
+
+  // Synchronized state refs for callbacks & listeners
+  const languageRef = useRef<'kn-IN' | 'hi-IN' | 'en-IN'>('en-IN');
+  const ivrStepRef = useRef<string>('welcome');
+  const collectedDataRef = useRef<any>({});
+  const dialogueHistoryRef = useRef<Array<{ role: 'user' | 'assistant'; text: string }>>([]);
+
+  // Silence / Inactivity Timers
+  const silenceTimerRef = useRef<any>(null);
+  const initialGreetingActiveRef = useRef<boolean>(false);
   const processingSpeechRef = useRef<boolean>(false);
+  const isIvrSpeakingRef = useRef<boolean>(false);
   const activeUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+
+  // Keep refs synchronized
+  const updateLanguage = (newLang: 'kn-IN' | 'hi-IN' | 'en-IN') => {
+    languageRef.current = newLang;
+    setLanguage(newLang);
+  };
+
+  const updateStep = (newStep: string) => {
+    ivrStepRef.current = newStep;
+    setIvrStep(newStep);
+  };
+
+  const updateCollectedData = (data: any) => {
+    const merged = { ...collectedDataRef.current, ...data };
+    collectedDataRef.current = merged;
+    setCollectedData(merged);
+  };
 
   // Web Audio Context initialization
   const getAudioContext = () => {
@@ -166,70 +212,46 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
 
   // Clear all silence timers
   const clearSilenceTimers = () => {
-    if (silence20TimerRef.current) {
-      clearTimeout(silence20TimerRef.current);
-      silence20TimerRef.current = null;
-    }
-    if (silence10TimerRef.current) {
-      clearTimeout(silence10TimerRef.current);
-      silence10TimerRef.current = null;
-    }
-    if (speechSilenceTimerRef.current) {
-      clearTimeout(speechSilenceTimerRef.current);
-      speechSilenceTimerRef.current = null;
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
     }
   };
 
   // Reset and start silence watch when IVR finishes speaking (45s duration)
   const startSilenceWatch = () => {
     clearSilenceTimers();
-    if (!callActive || isRecordingNote) return;
+    if (!callActiveRef.current || isRecordingNote) return;
 
-    silence20TimerRef.current = setTimeout(() => {
+    silenceTimerRef.current = setTimeout(() => {
       handleSilenceWarning();
-    }, 45000); // Generous 45 seconds before polite nudge
+    }, 45000); // 45 seconds before polite nudge
   };
 
-  // 45s silence fired: speak warning in current language, then start 20s final timer
+  // 45s silence fired: speak warning in current language
   const handleSilenceWarning = () => {
     clearSilenceTimers();
+    if (!callActiveRef.current) return;
 
-    let warningText = "We could not hear your voice clearly. Please speak again.";
-    if (language === 'kn-IN') {
-      warningText = "ತಾವು ಹೇಳುವುದು ಸ್ಪಷ್ಟವಾಗಿ ಕೇಳಿಸುತ್ತಿಲ್ಲ, ದಯವಿಟ್ಟು ಮತ್ತೊಮ್ಮೆ ತಿಳಿಸಿ.";
-    } else if (language === 'hi-IN') {
-      warningText = "आपकी आवाज़ स्पष्ट नहीं आ रही है, कृपया फिर से बोलें।";
+    let warningText = "We could not hear your voice clearly. Please speak your food safety issue.";
+    if (languageRef.current === 'kn-IN') {
+      warningText = "ತಾವು ಹೇಳುವುದು ಸ್ಪಷ್ಟವಾಗಿ ಕೇಳಿಸುತ್ತಿಲ್ಲ, ದಯವಿಟ್ಟು ಮತ್ತೊಮ್ಮೆ ತಮ್ಮ ದೂರಿನ ಬಗ್ಗೆ ತಿಳಿಸಿ.";
+    } else if (languageRef.current === 'hi-IN') {
+      warningText = "आपकी आवाज़ स्पष्ट नहीं आ रही है, कृपया अपनी शिकायत फिर से बताएं।";
     }
 
-    speakIVR(warningText, undefined, language, () => {
-      // Once warning finishes speaking, start 20s countdown before gentle signoff
-      silence10TimerRef.current = setTimeout(() => {
-        handleSilenceGoodbye();
-      }, 20000);
-    });
+    speakIVR(warningText, undefined, languageRef.current, () => {
+      startSilenceWatch();
+    }, true);
   };
 
-  // Silence final timeout: speak goodbye and end call
-  const handleSilenceGoodbye = () => {
-    clearSilenceTimers();
-
-    let goodbyeText = "Thank you for calling the Food Safety Helpline. Goodbye!";
-    if (language === 'kn-IN') {
-      goodbyeText = "ಧನ್ಯವಾದಗಳು, ಆಹಾರ ಸುರಕ್ಷತಾ ಸಹಾಯವಾಣಿಗೆ ಕರೆ ಮಾಡಿದ್ದಕ್ಕಾಗಿ ವಂದನೆಗಳು. ಬೈ!";
-    } else if (language === 'hi-IN') {
-      goodbyeText = "खाद्य सुरक्षा हेल्पलाइन में संपर्क करने के लिए धन्यवाद। बाय!";
-    }
-
-    speakIVR(goodbyeText, undefined, language, () => {
-      endCall();
-    });
-  };
-
-  // Internal audio/speech stopper without setting greeting cancellation flag
+  // Internal audio/speech stopper
   const stopSpeechOnly = () => {
     if (audioPlayerRef.current) {
-      audioPlayerRef.current.pause();
-      audioPlayerRef.current.currentTime = 0;
+      try {
+        audioPlayerRef.current.pause();
+        audioPlayerRef.current.currentTime = 0;
+      } catch {}
     }
     if (window.speechSynthesis) {
       try {
@@ -237,16 +259,19 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
       } catch {}
     }
     activeUtteranceRef.current = null;
+    isIvrSpeakingRef.current = false;
     setIsIvrSpeaking(false);
+    // Let the capture engine go back to normal sensitivity
+    if (voiceEngineRef.current) voiceEngineRef.current.setIvrSpeaking(false);
   };
 
   // Interruption Handler: Stop IVR Speaking when user interrupts or hangs up
   const interruptSpeaking = () => {
-    greetingCancelRef.current = true;
+    initialGreetingActiveRef.current = false;
     stopSpeechOnly();
   };
 
-  // Google Browser Web Speech API TTS (First Priority)
+  // Browser Web Speech API TTS
   const speakWithBrowserGoogle = (text: string, langCode: string, onEnd: () => void): boolean => {
     if (typeof window === 'undefined' || !window.speechSynthesis) return false;
     try {
@@ -255,17 +280,34 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
         window.speechSynthesis.resume();
       }
 
+      const cleanText = stripEmojis(text);
+      if (!cleanText) {
+        onEnd();
+        return false;
+      }
+
       const prefix = langCode.slice(0, 2).toLowerCase();
       const voices = window.speechSynthesis.getVoices();
 
-      // Find best available voice on the device (prioritizing Google keyboard / Android / native voice)
+      // Priority 1: Natural / Edge / Indian voices
       let voiceMatch = voices.find(v => {
         const vLang = v.lang.toLowerCase().replace('_', '-');
         const vName = v.name.toLowerCase();
-        return (vLang.startsWith(prefix) || vName.includes(prefix)) && 
-               (vName.includes('google') || vName.includes('natural'));
+        const matchesLang = vLang.startsWith(prefix) || vName.includes(prefix);
+        return matchesLang && (vName.includes('microsoft') || vName.includes('edge') || vName.includes('natural'));
       });
 
+      // Priority 2: Google voice
+      if (!voiceMatch) {
+        voiceMatch = voices.find(v => {
+          const vLang = v.lang.toLowerCase().replace('_', '-');
+          const vName = v.name.toLowerCase();
+          const matchesLang = vLang.startsWith(prefix) || vName.includes(prefix);
+          return matchesLang && vName.includes('google');
+        });
+      }
+
+      // Priority 3: Any voice matching target language
       if (!voiceMatch) {
         voiceMatch = voices.find(v => {
           const vLang = v.lang.toLowerCase().replace('_', '-');
@@ -273,15 +315,14 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
         });
       }
 
-      // If user selected Kannada or Hindi, but this browser has zero matching TTS voices installed:
-      // Return false so we can smoothly fall back to server audio without silence or error!
+      // If Kannada or Hindi and no native voice on device, prefer high-fidelity audio fallback
       if ((prefix === 'kn' || prefix === 'hi') && !voiceMatch) {
         return false;
       }
 
-      const utterance = new SpeechSynthesisUtterance(stripEmojis(text));
+      const utterance = new SpeechSynthesisUtterance(cleanText);
       utterance.lang = langCode;
-      utterance.rate = 1.4; // 1.4X speech rate as requested
+      utterance.rate = 1.15;
       utterance.pitch = 1.0;
       if (voiceMatch) utterance.voice = voiceMatch;
 
@@ -304,42 +345,59 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
     }
   };
 
-  // Play speech: 1st Priority Google Browser Web Speech, with server fallbacks
+  // Play speech: server neural audioUrl -> Browser SpeechSynthesis -> /api/tts
   const speakIVR = async (
     text: string, 
     audioUrl?: string, 
-    targetLang: string = language,
-    onFinish?: () => void
+    targetLang?: string,
+    onFinish?: () => void,
+    shouldStartListening: boolean = true
   ) => {
     stopSpeechOnly();
     clearSilenceTimers();
+
+    // The previous utterance is fully handled the moment we start replying.
+    // Keeping this false is what allows natural barge-in ("two people talking").
+    processingSpeechRef.current = false;
+
+    // Keep the microphone live while the assistant speaks, but raise the
+    // trigger bar (echo-cancelled) so it cannot hear itself - and the caller
+    // can still simply start talking to interrupt, like a real phone call.
+    if (voiceEngineRef.current) voiceEngineRef.current.setIvrSpeaking(true);
+
+    const effectiveLang = targetLang || languageRef.current;
     const cleanPrompt = stripEmojis(text);
     if (!cleanPrompt) {
       if (onFinish) onFinish();
+      if (shouldStartListening && callActiveRef.current && !isRecordingNote) {
+        startUserListening();
+      }
       return;
     }
 
+    isIvrSpeakingRef.current = true;
     setIsIvrSpeaking(true);
     setStatusMessage(text);
     setLastIvrResponse(text);
 
+    let hasHandledEnd = false;
     const handleSpeechEnd = () => {
+      if (hasHandledEnd) return;
+      hasHandledEnd = true;
+      isIvrSpeakingRef.current = false;
       setIsIvrSpeaking(false);
-      startUserListening();
+      if (voiceEngineRef.current) voiceEngineRef.current.setIvrSpeaking(false);
+
       if (onFinish) {
         onFinish();
-      } else {
+      }
+      if (shouldStartListening && callActiveRef.current && !isRecordingNote) {
+        startUserListening();
         startSilenceWatch();
       }
     };
 
-    // 1ST PRIORITY: Google Browser Web Speech API
-    const spokeWithBrowser = speakWithBrowserGoogle(cleanPrompt, targetLang, handleSpeechEnd);
-    if (spokeWithBrowser) {
-      return;
-    }
-
-    // 2ND PRIORITY: Pre-generated / server audioUrl fallback (when device lacks native Kannada/Hindi voices)
+    // 1ST PRIORITY: server-synthesised neural audio from /api/ivr/dialogue
     if (audioUrl) {
       try {
         if (!audioPlayerRef.current) {
@@ -348,7 +406,8 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
         audioPlayerRef.current.src = audioUrl;
         audioPlayerRef.current.onended = handleSpeechEnd;
         audioPlayerRef.current.onerror = () => {
-          fallbackSpeech(cleanPrompt, targetLang, handleSpeechEnd);
+          // Fallback to browser synthesis if audio URL playback has an issue
+          fallbackSpeech(cleanPrompt, effectiveLang, handleSpeechEnd);
         };
         await audioPlayerRef.current.play();
         return;
@@ -357,8 +416,14 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
       }
     }
 
-    // 3RD PRIORITY: In-browser speech synthesis or high-fidelity /api/tts
-    fallbackSpeech(cleanPrompt, targetLang, handleSpeechEnd);
+    // 2ND PRIORITY: Browser Google Web Speech API
+    const spokeWithBrowser = speakWithBrowserGoogle(cleanPrompt, effectiveLang, handleSpeechEnd);
+    if (spokeWithBrowser) {
+      return;
+    }
+
+    // 3RD PRIORITY: /api/tts fallback fetch
+    fallbackSpeech(cleanPrompt, effectiveLang, handleSpeechEnd);
   };
 
   const fallbackSpeech = async (text: string, targetLang: string, onEnd: () => void) => {
@@ -368,27 +433,21 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
       return;
     }
 
-    const prefix = targetLang.slice(0, 2).toLowerCase();
-
-    // High-fidelity Sarvam AI audio fallback
     try {
-      let langName = "English";
-      if (prefix === "kn") langName = "Kannada";
-      else if (prefix === "hi") langName = "Hindi";
-
       const res = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: cleanText, language: langName })
+        body: JSON.stringify({ text: cleanText, language: targetLang })
       });
 
       if (res.ok) {
         const data = await res.json();
-        if (data && data.audioBase64) {
+        const audioSrc = data.audioUrl || (data.audioBase64 ? `data:audio/wav;base64,${data.audioBase64}` : null);
+        if (audioSrc) {
           if (!audioPlayerRef.current) {
             audioPlayerRef.current = new Audio();
           }
-          audioPlayerRef.current.src = `data:audio/wav;base64,${data.audioBase64}`;
+          audioPlayerRef.current.src = audioSrc;
           audioPlayerRef.current.onended = () => onEnd();
           audioPlayerRef.current.onerror = () => onEnd();
           await audioPlayerRef.current.play();
@@ -399,144 +458,184 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
       console.warn("Fallback /api/tts request notice:", apiErr);
     }
 
-    // Final safety fallback
+    // Direct browser synthesis attempt
+    try {
+      if (window.speechSynthesis) {
+        const utt = new SpeechSynthesisUtterance(cleanText);
+        utt.lang = targetLang;
+        utt.onend = () => onEnd();
+        utt.onerror = () => onEnd();
+        window.speechSynthesis.speak(utt);
+        return;
+      }
+    } catch {}
+
     onEnd();
   };
 
-  // Start continuous listening for caller voice (Google Browser Web Speech API 1st Priority)
-  const startUserListening = () => {
-    if (!callActive || isRecordingNote) return;
+  // ---------------------------------------------------------------------------
+  // Voice capture engine
+  // Persistent microphone + real voice-activity detection + ONE dispatch per
+  // utterance. The mic stays open for the whole call, so it never blinks
+  // on/off between turns, and every utterance is transcribed by the server with
+  // the language FORCED (Kannada/Hindi included) instead of silently falling
+  // back to the device language (English).
+  // ---------------------------------------------------------------------------
 
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) return;
-
-    processingSpeechRef.current = false;
-    let localCapturedSpoken = '';
-
+  const transcribeUtterance = async (audio: Blob, lang: VoiceLang): Promise<string> => {
+    // 1) Server speech-to-text (Groq Whisper large-v3-turbo) with the
+    //    language forced, so Kannada is never transcribed as English.
     try {
-      if (speechRecognitionRef.current) {
-        try {
-          speechRecognitionRef.current.abort();
-        } catch {}
+      const form = new FormData();
+      form.append('audio', audio, 'utterance.webm');
+      form.append('language', lang);
+      form.append('hint', IVR_STT_HINTS[lang] || '');
+      const res = await fetch('/api/stt', { method: 'POST', body: form });
+      if (res.ok) {
+        const data: any = await res.json().catch(() => null);
+        const text = String(data?.transcript || '').trim();
+        if (text) return text;
+      } else {
+        console.warn('Server STT unavailable:', res.status);
       }
-
-      const recognition = new SpeechRecognition();
-      recognition.continuous = false;
-      recognition.interimResults = true;
-      recognition.lang = language;
-
-      recognition.onstart = () => {
-        setIsListening(true);
-      };
-
-      recognition.onresult = (event: any) => {
-        clearSilenceTimers();
-
-        let finalTranscript = '';
-        let interimTranscript = '';
-
-        for (let i = 0; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) {
-            finalTranscript += event.results[i][0].transcript;
-          } else {
-            interimTranscript += event.results[i][0].transcript;
-          }
-        }
-
-        const rawSpoken = (finalTranscript + interimTranscript).trim();
-        const cleanSpoken = rawSpoken
-          .replace(/\b(\w+)(?:\s+\1\b)+/gi, '$1')
-          .replace(/([\u0900-\u0D7F]+)(?:\s+\1)+/gu, '$1')
-          .trim();
-
-        if (cleanSpoken) {
-          localCapturedSpoken = cleanSpoken;
-          setLastCallerSpoken(cleanSpoken);
-          
-          // Wait for natural 2.5s silence before concluding user has finished speaking
-          if (speechSilenceTimerRef.current) {
-            clearTimeout(speechSilenceTimerRef.current);
-          }
-          speechSilenceTimerRef.current = setTimeout(() => {
-            if (isListening && !processingSpeechRef.current && localCapturedSpoken) {
-              clearSilenceTimers();
-              processingSpeechRef.current = true;
-              const speechToProcess = localCapturedSpoken;
-              localCapturedSpoken = '';
-              try {
-                recognition.abort();
-              } catch {}
-              setIsListening(false);
-              handleCallerSpeech(speechToProcess);
-            }
-          }, 2500);
-        }
-      };
-
-      recognition.onerror = () => {
-        setIsListening(false);
-      };
-
-      recognition.onend = () => {
-        setIsListening(false);
-
-        // CRITICAL FIX: If user spoke but browser closed recognition stream before marking isFinal=true, process it NOW!
-        if (localCapturedSpoken && localCapturedSpoken.trim() && !processingSpeechRef.current) {
-          processingSpeechRef.current = true;
-          const speechToProcess = localCapturedSpoken.trim();
-          localCapturedSpoken = '';
-          clearSilenceTimers();
-          handleCallerSpeech(speechToProcess);
-          return;
-        }
-
-        // Robust Auto-restart if we didn't get any result and we are still in listening mode
-        if (callActive && !isIvrSpeaking && !isRecordingNote && !greetingCancelRef.current && !processingSpeechRef.current) {
-          setTimeout(() => {
-            if (callActive && !isIvrSpeaking && !isRecordingNote && !greetingCancelRef.current && !processingSpeechRef.current) {
-              try {
-                recognition.start();
-              } catch (e) {}
-            }
-          }, 350);
-        }
-      };
-
-      speechRecognitionRef.current = recognition;
-      recognition.start();
-    } catch (e) {
-      console.warn("Speech recognition start warning:", e);
+    } catch (err) {
+      console.warn('Server STT request failed:', err);
     }
+
+    // 2) On-device Whisper (free, runs in the browser, no API credits).
+    //    Keeps the helpline hearing callers even when the cloud speech keys are
+    //    out of quota. Loaded lazily so it costs nothing until it is needed.
+    try {
+      setNotice(
+        lang === 'kn-IN'
+          ? 'ಧ್ವನಿಯನ್ನು ಗುರುತಿಸುತ್ತಿದೆ...'
+          : lang === 'hi-IN'
+          ? 'आवाज़ पहचान रहा है...'
+          : 'Recognising your speech...'
+      );
+      const { transcribeAudioInBrowser } = await import('../lib/clientWhisper');
+      const onDeviceText = await transcribeAudioInBrowser(audio, lang);
+      if (onDeviceText && onDeviceText.trim()) return onDeviceText.trim();
+    } catch (err) {
+      console.warn('On-device speech recognition unavailable:', err);
+    }
+
+    return '';
   };
 
-  // Play Language Prompts 1, 2, 3 instantly at 1.4X speed
+  const getVoiceEngine = (): VoiceCapture => {
+    if (!voiceEngineRef.current) {
+      voiceEngineRef.current = new VoiceCapture({
+        getLanguage: () => languageRef.current,
+        transcribe: transcribeUtterance,
+        onUtterance: (transcript) => {
+          if (!callActiveRef.current || isRecordingNote) return;
+          clearSilenceTimers();
+
+          if (processingSpeechRef.current) {
+            // A reply is already being composed - never answer one sentence twice.
+            setNotice('One moment please, I am answering...');
+            return;
+          }
+
+          setNotice('');
+          setLastCallerSpoken(transcript);
+          processingSpeechRef.current = true;
+          handleCallerSpeech(transcript);
+        },
+        onStateChange: (s) => {
+          setIsListening(s.capturing);
+          setCallerSpeaking(s.callerSpeaking);
+          setMicLevel(s.level);
+        },
+        onSpeechStart: () => {
+          // Barge-in: the caller can simply start talking over the assistant,
+          // exactly like interrupting a real person on a phone call.
+          if (isIvrSpeakingRef.current) interruptSpeaking();
+        },
+        onNotice: (msg) => setNotice(msg),
+        endSilenceMs: 900,   // answer almost immediately after the caller stops
+        maxUtteranceMs: 20000,
+        minUtteranceMs: 250, // short answers like "ಹೌದು" / "yes" must count
+        minBlobBytes: 700,
+        allowBargeIn: true,
+        bargeInHoldMs: 520,
+      });
+    }
+    return voiceEngineRef.current;
+  };
+
+  // Start / resume listening. The microphone is opened once per call and kept
+  // warm, so the recogniser is ready the instant the assistant stops speaking.
+  const startUserListening = () => {
+    if (!callActiveRef.current || isRecordingNote) return;
+    processingSpeechRef.current = false;
+    const engine = getVoiceEngine();
+    engine.setIvrSpeaking(isIvrSpeakingRef.current);
+
+    if (engine.isRunning) {
+      engine.resume();
+      return;
+    }
+
+    engine.start().then((ok) => {
+      if (!callActiveRef.current) return;
+      if (!ok) {
+        setNotice('Microphone blocked - tap the mic button and allow access.');
+        return;
+      }
+      setNotice('');
+      startSilenceWatch();
+    });
+  };
+
+  // Pause listening without closing the microphone
+  const stopUserListening = () => {
+    if (voiceEngineRef.current) voiceEngineRef.current.pause();
+    setCallerSpeaking(false);
+    setIsListening(false);
+  };
+
+  // Release the microphone completely (hang up / unmount)
+  const releaseVoiceEngine = () => {
+    if (voiceEngineRef.current) {
+      voiceEngineRef.current.dispose();
+      voiceEngineRef.current = null;
+    }
+    setCallerSpeaking(false);
+    setMicLevel(0);
+    setIsListening(false);
+  };
+
+  // Play Language Prompts 1, 2, 3 at startup
   const playTrilingualGreeting = async () => {
-    greetingCancelRef.current = false;
+    initialGreetingActiveRef.current = true;
     clearSilenceTimers();
 
     const options = [
-      { text: "ನಮಸ್ಕಾರ, ಆಹಾರ ಸುರಕ್ಷತಾ ಮತ್ತು ನೈರ್ಮಲ್ಯ ಪರಿಶೀಲನೆ ಸಹಾಯವಾಣಿಗೆ ತಮಗೆ ಆದರದ ಸ್ವಾಗತ. ಕನ್ನಡಕ್ಕಾಗಿ 1 ಒತ್ತಿ.", lang: "kn-IN" },
-      { text: "खाद्य सुरक्षा एवं निरीक्षण हेल्पलाइन में आपका स्वागत है। हिंदी के लिए 2 दबाएँ।", lang: "hi-IN" },
-      { text: "Welcome to the Food Safety & Standards Inspection Authority Helpline. For English, press 3.", lang: "en-IN" }
+      { text: "ಆಹಾರ ಸುರಕ್ಷತಾ ಸಹಾಯವಾಣಿ. ಕನ್ನಡಕ್ಕಾಗಿ 1 ಒತ್ತಿ.", lang: "kn-IN" },
+      { text: "खाद्य सुरक्षा हेल्पलाइन। हिंदी के लिए 2 दबाएँ।", lang: "hi-IN" },
+      { text: "Food Safety Helpline. For English, press 3.", lang: "en-IN" }
     ];
 
     for (let i = 0; i < options.length; i++) {
-      if (greetingCancelRef.current) break;
+      if (!initialGreetingActiveRef.current || !callActiveRef.current) break;
       const opt = options[i];
 
       await new Promise<void>((resolve) => {
         speakIVR(opt.text, undefined, opt.lang, () => {
           resolve();
-        });
+        }, false);
       });
 
-      // Brief 200ms cadence between language options
-      if (i < options.length - 1 && !greetingCancelRef.current) {
+      if (i < options.length - 1 && initialGreetingActiveRef.current && callActiveRef.current) {
         await new Promise((r) => setTimeout(r, 200));
       }
     }
 
-    if (!greetingCancelRef.current) {
+    if (initialGreetingActiveRef.current && callActiveRef.current) {
+      initialGreetingActiveRef.current = false;
+      startUserListening();
       startSilenceWatch();
     }
   };
@@ -545,51 +644,125 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
   const startCall = async () => {
     getAudioContext();
     clearSilenceTimers();
+    dialogueHistoryRef.current = [];
+    callActiveRef.current = true;
     setCallActive(true);
     setCallDuration(0);
-    setIvrStep('welcome');
-    setCollectedData({});
+    updateStep('welcome');
+    updateCollectedData({});
     setAudioNoteUrl('');
+    setLastCallerSpoken('');
+    setLastIvrResponse('');
+    setNotice('');
+    setCallerSpeaking(false);
+    processingSpeechRef.current = false;
 
-    // Timer
+    // New conversation id: every turn of this call is persisted in the database
+    callIdRef.current = `IVR-${Date.now().toString(36).toUpperCase()}-${Math.random()
+      .toString(36)
+      .slice(2, 6)
+      .toUpperCase()}`;
+    turnIndexRef.current = 0;
+
+    // Open the microphone ONCE and keep it open for the whole call, so the mic
+    // never has to be re-armed (no on/off blinking) and is instant between turns.
+    const engine = getVoiceEngine();
+    engine.setIvrSpeaking(true);
+    const micReady = await engine.start();
+    if (!micReady) {
+      setNotice('Microphone blocked - tap the mic button and allow access.');
+    }
+    engine.setIvrSpeaking(true);
+
+    // Register the call in the database (caller identity + language + transcript)
+    fetch('/api/ivr/call/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        callId: callIdRef.current,
+        profile,
+        language: languageRef.current,
+      }),
+    }).catch(() => {});
+
+    // Call timer
     if (callTimerRef.current) clearInterval(callTimerRef.current);
     callTimerRef.current = setInterval(() => {
       setCallDuration((prev) => prev + 1);
     }, 1000);
 
-    // Play 1 in Kannada, 2 in Hindi, 3 in English
+    // Start trilingual greeting
     playTrilingualGreeting();
   };
 
   // Hang Up Call
   const endCall = () => {
-    greetingCancelRef.current = true;
-    interruptSpeaking();
+    initialGreetingActiveRef.current = false;
+    callActiveRef.current = false;
+    isIvrSpeakingRef.current = false;
+    stopSpeechOnly();
+    stopUserListening();
+    releaseVoiceEngine();
     clearSilenceTimers();
-    if (speechRecognitionRef.current) {
-      speechRecognitionRef.current.abort();
-    }
-    if (callTimerRef.current) {
-      clearInterval(callTimerRef.current);
-    }
-    if (noteTimerRef.current) {
-      clearInterval(noteTimerRef.current);
-    }
+    processingSpeechRef.current = false;
+
+    if (callTimerRef.current) clearInterval(callTimerRef.current);
+    if (noteTimerRef.current) clearInterval(noteTimerRef.current);
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
+      try { mediaRecorderRef.current.stop(); } catch {}
     }
+
+    // Close the call record in the database with the full transcript
+    if (callIdRef.current) {
+      fetch('/api/ivr/call/end', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          callId: callIdRef.current,
+          language: languageRef.current,
+          collectedData: collectedDataRef.current,
+          history: dialogueHistoryRef.current,
+        }),
+      }).catch(() => {});
+    }
+
+    dialogueHistoryRef.current = [];
     setCallActive(false);
     setIsListening(false);
     setIsRecordingNote(false);
+    setCallerSpeaking(false);
+    setMicLevel(0);
     setStatusMessage('Call Ended');
   };
 
   // Handle DTMF Dialpad Press
   const handleKeypadPress = async (digit: string) => {
-    greetingCancelRef.current = true;
+    initialGreetingActiveRef.current = false;
     playDTMFTone(digit);
-    interruptSpeaking();
+    stopSpeechOnly();
     clearSilenceTimers();
+    // Drop any half-captured speech so a keypad press can never be mixed with it
+    if (voiceEngineRef.current) voiceEngineRef.current.abortCurrent();
+    processingSpeechRef.current = false;
+
+    // Immediately reflect selected language
+    if (digit === '1') {
+      updateLanguage('kn-IN');
+      setNotice('ಕನ್ನಡ ಆಯ್ಕೆ ಮಾಡಲಾಗಿದೆ - ಈಗ ಮಾತನಾಡಿ.');
+    } else if (digit === '2') {
+      updateLanguage('hi-IN');
+      setNotice('हिंदी चुना गया - अब बोलिए।');
+    } else if (digit === '3') {
+      updateLanguage('en-IN');
+      setNotice('English selected - please speak now.');
+    }
+
+    // The caller picked a language: make sure the mic is live straight away so
+    // the first sentence is never missed while the prompt is still playing.
+    const engine = getVoiceEngine();
+    if (!engine.isRunning) {
+      void engine.start();
+    }
 
     sendIVRInput({ digits: digit });
   };
@@ -614,7 +787,17 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
     isVoiceNote?: boolean; 
   }) => {
     clearSilenceTimers();
-    setStatusMessage('AI is analyzing complaint...');
+    setStatusMessage('One moment...');
+
+    const activeLanguage = languageRef.current;
+    const activeStep = ivrStepRef.current;
+    const currentData = collectedDataRef.current;
+
+    const userTurnText = message || (digits ? `Pressed ${digits}` : (isVoiceNote ? 'Attached voice note' : ''));
+    if (userTurnText) {
+      dialogueHistoryRef.current.push({ role: 'user', text: userTurnText });
+    }
+    turnIndexRef.current += 1;
 
     try {
       const response = await fetch('/api/ivr/dialogue', {
@@ -623,12 +806,15 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
         body: JSON.stringify({
           message,
           digits,
-          step: ivrStep,
-          language,
+          step: activeStep,
+          language: activeLanguage,
+          history: dialogueHistoryRef.current,
           profile,
-          collectedData,
+          collectedData: currentData,
           audioNoteUrl: inputAudioUrl,
-          isVoiceNote
+          isVoiceNote,
+          callId: callIdRef.current,
+          turnIndex: turnIndexRef.current
         })
       });
 
@@ -636,34 +822,45 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
       setStatusMessage('Connected');
       if (!data) return;
 
-      if (data.language && data.language !== language) {
-        setLanguage(data.language);
+      if (data.text) {
+        dialogueHistoryRef.current.push({ role: 'assistant', text: data.text });
       }
+
+      const nextLang = (data.language || activeLanguage) as 'kn-IN' | 'hi-IN' | 'en-IN';
+      updateLanguage(nextLang);
+
       if (data.collectedData) {
-        setCollectedData(data.collectedData);
+        updateCollectedData(data.collectedData);
       }
       if (data.nextStep) {
-        setIvrStep(data.nextStep);
+        updateStep(data.nextStep);
       }
 
       // Handle Press 7 Flow (Voice Note Recording)
       if (data.nextStep === 'ready_for_beep' || digits === '7') {
-        await speakIVR(data.text, data.audioUrl, data.language || language, async () => {
+        await speakIVR(data.text, data.audioUrl, nextLang, async () => {
           setTimeout(async () => {
             await playBeepSound();
             startVoiceNoteRecording();
           }, 200);
-        });
+        }, false);
         return;
       }
 
-      // Normal prompt speaking
+      // Speak IVR response and then immediately enable listening in target language
       if (data.text) {
-        speakIVR(data.text, data.audioUrl, data.language || language);
+        speakIVR(data.text, data.audioUrl, nextLang, undefined, true);
       }
     } catch (err) {
       console.error("IVR interaction failed:", err);
       setStatusMessage('Connected');
+      setNotice('Connection hiccup - please say that again.');
+      processingSpeechRef.current = false;
+      if (voiceEngineRef.current) voiceEngineRef.current.setIvrSpeaking(false);
+      // If error occurs, ensure user listening is restored
+      if (callActiveRef.current) {
+        startUserListening();
+      }
     }
   };
 
@@ -671,6 +868,8 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
   const startVoiceNoteRecording = async () => {
     try {
       clearSilenceTimers();
+      stopUserListening();
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
       mediaRecorderRef.current = mediaRecorder;
@@ -710,17 +909,17 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
     setIsRecordingNote(false);
   };
 
-  // Transcribe recorded voice with STT, upload audio file, and react properly in IVR
+  // Transcribe recorded voice with STT, upload audio file, and react in IVR
   const uploadVoiceNote = async (audioBlob: Blob) => {
     try {
       setStatusMessage('Processing your recorded voice note...');
 
-      // 1. Transcribe the recorded voice with STT so IVR understands what was spoken
+      // 1. Transcribe the recorded voice with STT
       let transcript = '';
       try {
         const sttForm = new FormData();
         sttForm.append('audio', audioBlob, 'recording.webm');
-        const langName = language === 'kn-IN' ? 'Kannada' : (language === 'hi-IN' ? 'Hindi' : 'English');
+        const langName = languageRef.current === 'kn-IN' ? 'Kannada' : (languageRef.current === 'hi-IN' ? 'Hindi' : 'English');
         sttForm.append('language', langName);
 
         const sttRes = await fetch('/api/stt', { method: 'POST', body: sttForm });
@@ -754,13 +953,13 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
       }
 
       const updated = { 
-        ...collectedData, 
-        audioNoteUrl: uploadedUrl || collectedData.audioNoteUrl,
-        cause: transcript || collectedData.cause
+        ...collectedDataRef.current, 
+        audioNoteUrl: uploadedUrl || collectedDataRef.current.audioNoteUrl,
+        cause: transcript || collectedDataRef.current.cause
       };
-      setCollectedData(updated);
+      updateCollectedData(updated);
 
-      // React properly to what the caller said in their voice note!
+      // React properly to what the caller said in their voice note
       sendIVRInput({
         message: transcript || "Voice note recorded and attached.",
         audioNoteUrl: uploadedUrl,
@@ -806,6 +1005,9 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
           <div className="flex items-center gap-2 px-3 py-1 bg-white/20 backdrop-blur-xl border border-white/30 rounded-full text-white text-xs font-bold shadow-md">
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping inline-block" />
             <span>{formatTime(callDuration)}</span>
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/30 uppercase font-black">
+              {language === 'kn-IN' ? 'ಕನ್ನಡ' : language === 'hi-IN' ? 'हिंदी' : 'ENG'}
+            </span>
           </div>
         )}
       </div>
@@ -833,24 +1035,58 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
               Recording Voice Note ({formatTime(recordingSeconds)}) — Press # to Stop
             </div>
           ) : isIvrSpeaking ? (
-            <div className="text-white font-medium text-xs flex items-center justify-center gap-1.5">
-              <Volume2 size={15} className="animate-pulse text-white/90 shrink-0" />
-              <span className="truncate">Speaking... Tap any key to interrupt</span>
+            <div className="space-y-1.5">
+              <div className="text-amber-200 font-medium text-xs flex items-center justify-center gap-1.5">
+                <Volume2 size={15} className="animate-pulse text-amber-300 shrink-0" />
+                <span className="truncate">
+                  {language === 'kn-IN' ? 'ಮಾತನಾಡುತ್ತಿದೆ... (ಮಾತನಾಡಿ, ನಿಲ್ಲಿಸುತ್ತೇನೆ)' : language === 'hi-IN' ? 'बोल रहा है... (बोलिए, रुक जाऊँगा)' : 'Speaking... (just start talking to interrupt)'}
+                </span>
+              </div>
+              {isListening && (
+                <div className="text-[10px] text-emerald-300/90 font-semibold flex items-center justify-center gap-1">
+                  <Mic size={11} className="text-emerald-400 shrink-0" />
+                  <span>Mic live</span>
+                </div>
+              )}
+            </div>
+          ) : callerSpeaking ? (
+            <div className="space-y-1.5">
+              <div className="text-sky-200 font-bold text-xs flex items-center justify-center gap-1.5">
+                <Mic size={16} className="text-sky-300 shrink-0" />
+                <span>
+                  {language === 'kn-IN' ? 'ಕೇಳಿಸುತ್ತಿದೆ... ಮಾತನಾಡಿ' : language === 'hi-IN' ? 'सुन रहा हूँ... बोलिए' : 'I am listening... go ahead'}
+                </span>
+              </div>
+              <div className="h-1 w-full rounded-full bg-white/15 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-emerald-400 transition-all duration-150"
+                  style={{ width: `${Math.min(100, Math.round(micLevel * 140))}%` }}
+                />
+              </div>
             </div>
           ) : isListening ? (
-            <div className="text-emerald-300 font-medium text-xs flex items-center justify-center gap-1.5">
-              <Mic size={15} className="animate-pulse shrink-0" />
-              <span>Listening to your voice...</span>
+            <div className="text-emerald-300 font-semibold text-xs flex items-center justify-center gap-1.5">
+              <Mic size={16} className="text-emerald-400 shrink-0" />
+              <span>
+                {language === 'kn-IN' ? 'ಧ್ವನಿ ಆಲಿಸುತ್ತಿದೆ... ಮಾತನಾಡಿ' : language === 'hi-IN' ? 'सुन रहा है... बोलिए' : 'Listening... speak any time'}
+              </span>
             </div>
           ) : (
             <div className="text-white/80 text-xs font-medium truncate">
-              {callActive ? 'Awaiting keypad press or speech' : 'Press Start Call below'}
+              {notice
+                ? notice
+                : callActive
+                ? 'Awaiting keypad press or speech'
+                : 'Press Start Call below'}
             </div>
+          )}
+          {callActive && notice && (isIvrSpeaking || callerSpeaking || isListening) && (
+            <div className="mt-1 text-[10px] text-amber-200/90 font-semibold truncate">{notice}</div>
           )}
         </div>
       </div>
 
-      {/* Live Conversation Transcript Card: Displays caller speech and IVR reaction */}
+      {/* Live Conversation Transcript Card */}
       {callActive && (lastIvrResponse || lastCallerSpoken) && (
         <div className="w-full max-w-xs my-1.5 bg-black/30 backdrop-blur-xl border border-white/20 rounded-2xl p-3 shadow-lg text-left space-y-1.5 transition-all text-xs">
           {lastIvrResponse && (
@@ -868,7 +1104,7 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
         </div>
       )}
 
-      {/* Dialpad: Independent, NO background, NO border on container, Glassmorphism Transparent Buttons */}
+      {/* Dialpad: Independent, Glassmorphism Transparent Buttons */}
       <div className="w-full max-w-xs my-3">
         <div className="grid grid-cols-3 gap-3">
           {[
@@ -898,6 +1134,12 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
               className={`flex flex-col items-center justify-center h-16 sm:h-18 rounded-2xl transition-all select-none active:scale-95 cursor-pointer backdrop-blur-xl ${
                 !callActive
                   ? 'bg-white/10 hover:bg-white/15 border border-white/15 text-white/50 cursor-not-allowed'
+                  : digit === '1' && language === 'kn-IN'
+                  ? 'bg-amber-500/40 border-2 border-amber-300 text-white shadow-xl ring-2 ring-amber-400/50'
+                  : digit === '2' && language === 'hi-IN'
+                  ? 'bg-amber-500/40 border-2 border-amber-300 text-white shadow-xl ring-2 ring-amber-400/50'
+                  : digit === '3' && language === 'en-IN'
+                  ? 'bg-amber-500/40 border-2 border-amber-300 text-white shadow-xl ring-2 ring-amber-400/50'
                   : digit === '7'
                   ? 'bg-white/25 hover:bg-white/35 border border-white/40 text-white shadow-lg ring-1 ring-white/30'
                   : 'bg-white/15 hover:bg-white/25 border border-white/20 text-white shadow-lg hover:shadow-xl'
@@ -913,14 +1155,34 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
       </div>
 
       {/* Call Action Controls */}
-      <div className="w-full max-w-xs flex items-center justify-center gap-3 pt-2 pb-4">
+      <div className="w-full max-w-xs flex items-center justify-center gap-2.5 pt-2 pb-4">
         {callActive ? (
           <>
+            {/* Direct Mic Listening Toggle Button */}
+            <button
+              onClick={() => {
+                if (isListening) {
+                  stopUserListening();
+                } else {
+                  stopSpeechOnly();
+                  startUserListening();
+                }
+              }}
+              title={isListening ? "Mute Microphone" : "Enable Microphone & Speak"}
+              className={`p-3.5 rounded-2xl border backdrop-blur-xl shadow-lg transition-all active:scale-95 cursor-pointer ${
+                isListening
+                  ? 'bg-emerald-500/40 text-emerald-200 border-emerald-400 ring-2 ring-emerald-400/40 animate-pulse'
+                  : 'bg-white/20 hover:bg-white/30 text-white border-white/30'
+              }`}
+            >
+              {isListening ? <Mic size={18} /> : <MicOff size={18} />}
+            </button>
+
             {/* Interrupt Speech Button */}
             <button
               onClick={interruptSpeaking}
               title="Mute / Stop IVR voice"
-              className="p-3.5 rounded-2xl bg-white/20 hover:bg-white/30 text-white border border-white/30 backdrop-blur-xl shadow-lg transition-all active:scale-95"
+              className="p-3.5 rounded-2xl bg-white/20 hover:bg-white/30 text-white border border-white/30 backdrop-blur-xl shadow-lg transition-all active:scale-95 cursor-pointer"
             >
               <VolumeX size={18} />
             </button>
@@ -938,14 +1200,14 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
             {isRecordingNote ? (
               <button
                 onClick={stopVoiceNoteRecording}
-                className="px-4 py-3.5 rounded-2xl bg-amber-500/90 hover:bg-amber-500 text-slate-950 font-bold text-xs backdrop-blur-xl shadow-lg border border-white/30 transition-all active:scale-95"
+                className="px-4 py-3.5 rounded-2xl bg-amber-500/90 hover:bg-amber-500 text-slate-950 font-bold text-xs backdrop-blur-xl shadow-lg border border-white/30 transition-all active:scale-95 cursor-pointer"
               >
                 Stop (#)
               </button>
             ) : (
               <button
                 onClick={() => handleKeypadPress('7')}
-                className="px-4 py-3.5 rounded-2xl bg-white/20 hover:bg-white/30 text-white font-bold text-xs backdrop-blur-xl shadow-lg border border-white/30 transition-all active:scale-95"
+                className="px-4 py-3.5 rounded-2xl bg-white/20 hover:bg-white/30 text-white font-bold text-xs backdrop-blur-xl shadow-lg border border-white/30 transition-all active:scale-95 cursor-pointer"
               >
                 Record (7)
               </button>
