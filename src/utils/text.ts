@@ -96,6 +96,47 @@ export function cleanSpeechTranscript(text: string): string {
 }
 
 /**
+ * True only when the WHOLE utterance is a confirmation ("yes", "haan",
+ * "ಹೌದು", "ok please"), never when the word merely appears inside a longer
+ * sentence. This replaces the old `text.includes('ha')` style test, which
+ * matched "what", "have", "shall", "harsh" and submitted complaints the caller
+ * never confirmed.
+ */
+const AFFIRM_WORDS = [
+  'yes', 'yeah', 'yep', 'yup', 'ya', 'ok', 'okay', 'okey', 'sure',
+  'confirm', 'confirmed', 'submit', 'proceed', 'done', 'sari', 'saree', 'sare',
+  'haan', 'han', 'ha', 'houdu', 'aagali', 'aaytu',
+  'ಹೌದು', 'ಸರಿ', 'ಆಗಲಿ', 'ಆಯ್ತು',
+  'हाँ', 'हां', 'जी', 'पुष्टि', 'मंज़ूर', 'ठीक', 'दर्ज',
+];
+
+const AFFIRM_TRAIL = [
+  'please', 'it', 'do', 'that', 'thats', 'is', 'all', 'go', 'ahead', 'to',
+  'submit', 'now', 'fine', 'ok', 'okay', 'yes', 'sir', 'madam', 'haan',
+  'is', 'hai', 'है', 'करें', 'करो', 'దయచేసి', 'ದಯವಿಟ್ಟು',
+];
+
+export function isAffirmation(text: string): boolean {
+  const raw = String(text || '').toLowerCase().replace(/[\s!.,?;:।"'()]+$/g, '').trim();
+  if (!raw) return false;
+  const words = raw.split(/\s+/).filter(Boolean);
+  if (!words.length) return false;
+
+  const norm = (w: string) => w.replace(/[^\p{L}\p{N}']/gu, '');
+  const first = norm(words[0]);
+
+  if (words.length === 1) return AFFIRM_WORDS.includes(first);
+  if (!AFFIRM_WORDS.includes(first)) return false;
+
+  // Every remaining token must be a filler/politeness word, otherwise this is a
+  // real sentence that merely starts with "ok"/"yes" and must not auto-submit.
+  return words.slice(1).every((w) => {
+    const n = norm(w);
+    return !n || AFFIRM_TRAIL.includes(n) || AFFIRM_WORDS.includes(n);
+  });
+}
+
+/**
  * Merges a session prefix and incoming new transcript without seam duplication
  */
 export function mergeTranscripts(prefix: string, newText: string): string {

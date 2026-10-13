@@ -4,27 +4,35 @@ import UploadData from './UploadData';
 import Dashboard from './Dashboard';
 import { Lock, Key, ArrowLeft, Database, BarChart3, LogOut } from 'lucide-react';
 import { motion } from 'motion/react';
+import { adminLogin, adminLogout, hasAdminSession } from '../lib/adminAuth';
 
 function PINPad({ onVerify }: { onVerify: () => void }) {
   const [pin, setPin] = useState('');
   const [error, setError] = useState(false);
-  const correctPin = '0000';
+  const [checking, setChecking] = useState(false);
 
+  // The PIN is verified by the server, which issues the session token the
+  // dashboard API requires. It is deliberately NOT compared in the browser:
+  // a hard-coded constant here protected nothing, since the API was open.
   const handlePress = (num: string) => {
-    if (pin.length < 4) {
-      const newPin = pin + num;
-      setPin(newPin);
-      if (newPin.length === 4) {
-        if (newPin === correctPin) {
-          onVerify();
-        } else {
+    if (checking || pin.length >= 4) return;
+    const newPin = pin + num;
+    setPin(newPin);
+    if (newPin.length === 4) {
+      setChecking(true);
+      adminLogin(newPin)
+        .then((ok) => {
+          if (ok) {
+            onVerify();
+            return;
+          }
           setError(true);
           setTimeout(() => {
             setPin('');
             setError(false);
           }, 1000);
-        }
-      }
+        })
+        .finally(() => setChecking(false));
     }
   };
 
@@ -74,7 +82,9 @@ function PINPad({ onVerify }: { onVerify: () => void }) {
 }
 
 export default function Admin() {
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  // Resume an existing server session (e.g. after a re-render or a page refresh
+  // within the same tab) instead of forcing the PIN again.
+  const [isAuthenticated, setIsAuthenticated] = useState(() => hasAdminSession());
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -94,6 +104,8 @@ export default function Admin() {
       <div className="px-6 flex items-center justify-between">
         <button 
           onClick={() => {
+            // Invalidate the server session as well, not just the local state.
+            void adminLogout();
             setIsAuthenticated(false);
             navigate('/admin');
           }}

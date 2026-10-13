@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { KBDocument } from '../types';
+import { adminFetch } from '../lib/adminAuth';
 
 interface AiEraseResult {
   matchingDocIds: string[];
@@ -45,7 +46,7 @@ export default function UploadData() {
   const fetchKnowledge = async () => {
     setIsLoadingDocs(true);
     try {
-      const res = await fetch('/api/knowledge');
+      const res = await adminFetch('/api/knowledge');
       const data = await res.json();
       if (Array.isArray(data)) {
         setFiles(data);
@@ -79,7 +80,7 @@ export default function UploadData() {
     formData.append('file', file);
 
     try {
-      const res = await fetch('/api/process-document', { method: 'POST', body: formData });
+      const res = await adminFetch('/api/process-document', { method: 'POST', body: formData });
       const data = await res.json();
       
       if (!res.ok || data.error) {
@@ -91,7 +92,7 @@ export default function UploadData() {
       const detectedType = isPdf ? 'pdf' : isImage ? 'image' : 'text';
       const docId = Date.now().toString();
 
-      await fetch('/api/knowledge', {
+      await adminFetch('/api/knowledge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -136,7 +137,7 @@ export default function UploadData() {
 
     try {
       const docId = Date.now().toString();
-      await fetch('/api/knowledge', {
+      await adminFetch('/api/knowledge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -161,7 +162,7 @@ export default function UploadData() {
 
   const deleteDocument = async (id: string) => {
     try {
-      await fetch(`/api/knowledge/${id}`, { method: 'DELETE' });
+      await adminFetch(`/api/knowledge/${id}`, { method: 'DELETE' });
 
       if (selectedDoc?.id === id) {
         setSelectedDoc(null);
@@ -192,7 +193,7 @@ export default function UploadData() {
     setIsEvaluatingErase(true);
     setErrorMessage(null);
     try {
-      const res = await fetch('/api/admin/ai-eval-erase', {
+      const res = await adminFetch('/api/admin/ai-eval-erase', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -228,7 +229,7 @@ export default function UploadData() {
     setIsDeletingBatch(true);
     try {
       // Sync deletion to Turso
-      await fetch('/api/knowledge/batch-delete', {
+      await adminFetch('/api/knowledge/batch-delete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: selectedForErase }),

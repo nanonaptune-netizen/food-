@@ -6,7 +6,7 @@ import { VoiceInteraction, UserProfile } from '../types';
 import ParticleBall from './ParticleBall';
 import { RenderedMarkdown } from './RenderedMarkdown';
 import { transcribeAudioInBrowser } from '../lib/clientWhisper';
-import { stripEmojis, cleanSpeechTranscript, mergeTranscripts } from '../utils/text';
+import { stripEmojis, cleanSpeechTranscript, mergeTranscripts, isAffirmation } from '../utils/text';
 
 function isHallucinatedText(text: string): boolean {
   if (!text || !text.trim()) return true;
@@ -64,10 +64,19 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
   const transcriptRef = useRef<string>('');
   const accumulatedFinalRef = useRef<string>('');
   const sessionPrefixRef = useRef<string>('');
+  // Text captured by the CURRENT recognition session. Chrome resets its own
+  // result list on every start(), so this is rebuilt from scratch per session
+  // and merged with sessionPrefixRef (earlier sessions of the same turn).
+  const sessionTextRef = useRef<string>('');
+  // True while the caller is driving the orb by voice, so listening is re-armed
+  // automatically as soon as the assistant finishes speaking.
+  const autoListenRef = useRef<boolean>(false);
+  const vizStreamRef = useRef<MediaStream | null>(null);
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
   const silenceTimerRef = useRef<any>(null);
   const isListeningRef = useRef<boolean>(false);
   const isSpeakingRef = useRef<boolean>(false);
+  const isLoadingRef = useRef<boolean>(false);
   const audioContextRef = useRef<AudioContext | null>(null);
   const vadIntervalRef = useRef<any>(null);
   const hasSpokenRef = useRef<boolean>(false);
@@ -129,6 +138,17 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isLoading, transcript]);
+
+  // Release the orb visualiser microphone when the page goes away.
+  useEffect(() => {
+    return () => {
+      autoListenRef.current = false;
+      try {
+        vizStreamRef.current?.getTracks().forEach((t) => t.stop());
+      } catch {}
+      vizStreamRef.current = null;
+    };
+  }, []);
 
   const startRecording = async () => {
     try {
@@ -320,34 +340,41 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
         else recognition.lang = 'en-IN';
 
         recognition.onstart = () => {
+          // Every start() is a brand-new recognition session with a fresh,
+          // empty result list. Start this session's text fresh too; text from
+          // earlier sessions of the same turn is held in sessionPrefixRef.
+          sessionTextRef.current = '';
           updateListeningState(true);
           setMicError(null);
         };
 
         recognition.onresult = (event: any) => {
-          let currentFinal = '';
-          let currentInterim = '';
-          
-          for (let i = event.resultIndex; i < event.results.length; ++i) {
+          // ROOT-CAUSE FIX (doubled words / "2 lines became 10 lines"):
+          // rebuild the ENTIRE session transcript on every event instead of
+          // appending to a running accumulator. Chrome re-delivers results it
+          // has already reported -- especially after its automatic
+          // onend -> start() restart -- so appending re-added the same words
+          // again and again, doubling the caller's sentence each cycle.
+          let finalText = '';
+          let interimText = '';
+
+          for (let i = 0; i < event.results.length; i++) {
             const item = event.results[i];
-            if (item && item[0]) {
-              if (item.isFinal) {
-                currentFinal += item[0].transcript + ' ';
-              } else {
-                currentInterim += item[0].transcript;
-              }
+            if (!item || !item[0]) continue;
+            if (item.isFinal) {
+              finalText += item[0].transcript + ' ';
+            } else {
+              interimText += item[0].transcript;
             }
           }
 
-          if (currentFinal) {
-            const cleanFinal = currentFinal.trim();
-            // Prevent duplicate appending of the exact same recognized chunk
-            if (!accumulatedFinalRef.current.includes(cleanFinal)) {
-              accumulatedFinalRef.current = cleanSpeechTranscript((accumulatedFinalRef.current + ' ' + cleanFinal).trim());
-            }
-          }
+          sessionTextRef.current = cleanSpeechTranscript((finalText + ' ' + interimText).trim());
 
-          const combined = cleanSpeechTranscript((accumulatedFinalRef.current + ' ' + currentInterim).trim());
+          // Merge with what previous sessions of this same turn already heard.
+          // mergeTranscripts overlaps the seam (up to 6 words) instead of
+          // repeating it, so a re-delivered tail folds into one sentence.
+          const combined = mergeTranscripts(sessionPrefixRef.current, sessionTextRef.current);
+          accumulatedFinalRef.current = combined;
 
           if (combined) {
             transcriptRef.current = combined;
@@ -382,7 +409,11 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
 
         recognition.onend = async () => {
           if (isListeningRef.current) {
-            // Keep speech recognition continuously running while user is in active speaking mode
+            // Chrome ends recognition by itself after a pause. Bank whatever this
+            // session heard (seam-merged, never re-appended) and restart, so one
+            // long utterance is never lost and never duplicated.
+            sessionPrefixRef.current = mergeTranscripts(sessionPrefixRef.current, sessionTextRef.current);
+            sessionTextRef.current = '';
             try {
               recognition.start();
             } catch {}
@@ -400,7 +431,10 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
   const speakWithBrowserGoogle = (text: string, lang: string): boolean => {
     if (typeof window === 'undefined' || !window.speechSynthesis) return false;
     try {
-      window.speechSynthesis.cancel();
+      // NOTE: no speechSynthesis.cancel() here. The caller (speak) has already
+      // stopped any previous audio, and cancelling again immediately before
+      // speak() is the known Chrome pattern that leaves the utterance queued
+      // twice / unreliably.
       if (window.speechSynthesis.paused) {
         window.speechSynthesis.resume();
       }
@@ -476,12 +510,14 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
         activeUtteranceRef.current = null;
         updateSpeakingState(false);
         setPlayingMsgId(null);
+        resumeListeningAfterSpeech();
       };
       utterance.onerror = (e) => {
         console.warn("Browser speech synthesis error:", e);
         activeUtteranceRef.current = null;
         updateSpeakingState(false);
         setPlayingMsgId(null);
+        resumeListeningAfterSpeech();
       };
 
       window.speechSynthesis.speak(utterance);
@@ -519,12 +555,18 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
         const audio = new Audio(audioUrl);
         audio.onplay = () => updateSpeakingState(true);
         audio.onended = () => {
+          // Clear the ref as well, otherwise it still points at the finished
+          // element and resumeListeningAfterSpeech() would refuse to re-arm.
+          activeAudioRef.current = null;
           updateSpeakingState(false);
           setPlayingMsgId(null);
+          resumeListeningAfterSpeech();
         };
         audio.onerror = () => {
+          activeAudioRef.current = null;
           updateSpeakingState(false);
           setPlayingMsgId(null);
+          resumeListeningAfterSpeech();
         };
         activeAudioRef.current = audio;
         await audio.play();
@@ -571,7 +613,6 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
     }
-    sessionPrefixRef.current = '';
     if (vadIntervalRef.current) {
       clearInterval(vadIntervalRef.current);
       vadIntervalRef.current = null;
@@ -588,15 +629,18 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
 
     const browserCaptured = transcriptRef.current.trim();
     accumulatedFinalRef.current = '';
-    
+    sessionPrefixRef.current = '';
+    sessionTextRef.current = '';
+
     // 1ST PRIORITY: Free native Browser Web Speech API (Chrome/Edge/Safari/Android/Kotlin-like)
+    // ROOT-CAUSE FIX (one sentence answered twice): the audio was previously
+    // re-transcribed through /api/stt AFTER the browser transcript had already
+    // been sent, so a single utterance could produce two user turns and the
+    // assistant answered it twice. One utterance now yields exactly one turn.
     if (browserCaptured && !isHallucinatedText(browserCaptured)) {
       setTranscript(browserCaptured);
       transcriptRef.current = '';
       handleSendMessage(browserCaptured);
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        stopAndTranscribeAudio().catch(() => {});
-      }
       return;
     }
 
@@ -620,6 +664,35 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     }
   };
 
+  // One shared microphone stream feeds the orb visualiser. It is opened once and
+  // kept warm (the recogniser itself owns its own capture), so the sphere shows
+  // the caller's real voice energy instead of synthetic waves.
+  const ensureVizStream = async () => {
+    if (vizStreamRef.current && vizStreamRef.current.active) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      vizStreamRef.current = stream;
+      setMicStream(stream);
+    } catch (e) {
+      // Non-fatal: the orb falls back to its synthetic animation.
+      console.warn('Orb visualiser microphone notice:', e);
+    }
+  };
+
+  // Re-arm listening the instant the assistant finishes speaking, so a voice
+  // conversation flows hands-free instead of stopping after every reply.
+  const resumeListeningAfterSpeech = () => {
+    if (!autoListenRef.current) return;
+    window.setTimeout(() => {
+      if (!autoListenRef.current) return;
+      if (isListeningRef.current || isSpeakingRef.current || activeAudioRef.current) return;
+      if (isLoadingRef.current) return;
+      void startListeningProcess();
+    }, 260);
+  };
+
   const startListeningProcess = async () => {
     stopSpeaking();
     if (silenceTimerRef.current) {
@@ -630,8 +703,19 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     transcriptRef.current = '';
     accumulatedFinalRef.current = '';
     sessionPrefixRef.current = '';
+    sessionTextRef.current = '';
+    // The caller is now driving the orb by voice: re-arm listening automatically
+    // once the assistant stops speaking.
+    autoListenRef.current = true;
     updateListeningState(true);
-    
+
+    // ROOT-CAUSE FIX (orb not reacting to the caller's voice): the ParticleBall
+    // visualiser is fed by micStream, but micStream was only ever created inside
+    // startRecording(), which is skipped whenever the native SpeechRecognition
+    // exists. So on desktop Chrome the orb always received null and animated
+    // synthetic waves instead of the real microphone.
+    void ensureVizStream();
+
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
     // Direct Browser Web Speech API (Native, instant, 100% Kotlin-like clean behavior)
@@ -639,8 +723,14 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     if (SpeechRecognition && recognitionRef.current) {
       try {
         recognitionRef.current.start();
-      } catch (e) {
-        console.warn("Native speech recognition start notice:", e);
+      } catch (e: any) {
+        // "already started" is harmless. Anything else means we are NOT actually
+        // listening, so never leave the UI claiming that we are.
+        if (!/already started|InvalidState/i.test(String(e?.message || e))) {
+          console.warn("Native speech recognition start notice:", e);
+          updateListeningState(false);
+          autoListenRef.current = false;
+        }
       }
     } else {
       // Fallback for browsers without native SpeechRecognition (e.g. Firefox desktop)
@@ -700,23 +790,24 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     };
     setMessages(prev => [...prev, userMsg]);
     setIsLoading(true);
+    isLoadingRef.current = true;
     setTranscript('');
     transcriptRef.current = '';
     setManualText('');
 
-    // Check for confirmation if a complaint was drafted
-    if (complaintDraft && (
-      queryText.toLowerCase().includes('yes') || 
-      queryText.toLowerCase().includes('confirm') || 
-      queryText.toLowerCase().includes('okay') || 
-      queryText.toLowerCase().includes('ha') || 
-      queryText.toLowerCase().includes('sari')
-    )) {
+    // Check for confirmation if a complaint was drafted.
+    // ROOT-CAUSE FIX (false confirmations): the old test used
+    // queryText.includes('ha'), which also matched "what", "have", "shall",
+    // "harsh" -- so an ordinary question filed the complaint without the caller
+    // ever confirming. isAffirmation only accepts a whole-utterance "yes".
+    if (complaintDraft && isAffirmation(queryText)) {
       await finalizeComplaint();
       return;
     }
 
-    const recentHistory = messages.slice(-8).map(m => ({
+    // Remember more of the conversation so the assistant can follow context the
+    // way a person does (it used to see only the last 8 entries).
+    const recentHistory = messages.slice(-16).map(m => ({
       role: m.sender === 'user' ? 'user' : 'assistant',
       content: m.text
     }));
@@ -726,7 +817,11 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     // Check local response cache for immediate fast return on repeated queries
     const cacheKey = `${language}:${queryText.toLowerCase().trim()}`;
     const cachedResponse = queryCacheRef.current.get(cacheKey);
-    if (cachedResponse && !complaintDraft) {
+    // A cached reply is only valid when there is no conversation context yet.
+    // Serving it mid-conversation returned the same context-free answer the
+    // second time the caller repeated a question - which read as "the AI has no
+    // idea what we were just talking about".
+    if (cachedResponse && !complaintDraft && userTurnCount === 1) {
       const assistantMsg: VoiceInteraction = { 
         id: (Date.now() + 1).toString(), 
         text: cachedResponse.response, 
@@ -823,6 +918,7 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
       speak(fallbackMsg.text);
     } finally { 
       setIsLoading(false); 
+      isLoadingRef.current = false;
       setTranscript(''); 
     }
   };
@@ -859,11 +955,18 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
         throw new Error("Failed to register complaint");
       }
       
-      const successMsg: VoiceInteraction = { 
-        id: Date.now().toString(), 
-        text: "Your report has been successfully registered! Our support team will review your audio and details. You can track progress anytime in Track Reports.", 
-        sender: 'assistant', 
-        timestamp: Date.now() 
+      // Only promise an audio review when audio was actually attached; on
+      // browsers with the native speech recogniser there is no MediaRecorder,
+      // so no clip exists and the old wording was simply untrue.
+      const successText = audioUrl
+        ? "Your report has been successfully registered along with your voice recording! Our support team will review it shortly. You can track progress anytime in Track Reports."
+        : "Your report has been successfully registered! Our support team will review the details shortly. You can track progress anytime in Track Reports.";
+
+      const successMsg: VoiceInteraction = {
+        id: Date.now().toString(),
+        text: successText,
+        sender: 'assistant',
+        timestamp: Date.now()
       };
       setMessages(prev => [...prev, successMsg]);
       speak(successMsg.text);

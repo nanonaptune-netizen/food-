@@ -1,3 +1,11 @@
+# ===========================================================================
+# DEPRECATED - DO NOT RUN.
+#
+# One-off migration script that has ALREADY been applied. Re-running it will
+# silently undo later fixes, because it rewrites whole function bodies by
+# string matching. patch_va.py in particular re-introduces the transcript
+# doubling bug. Kept for historical reference only.
+# ===========================================================================
 import re
 
 with open("server.ts", "r") as f:
@@ -17,7 +25,7 @@ new_stt = '''app.post("/api/stt", upload.single("audio"), async (req: any, res) 
     }
 
     const { language } = req.body;
-    const groqKey = process.env.GROQ_API_KEY || "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";
+    const groqKey = (process.env.GROQ_API_KEY || "").replace(/["'\\r\\n ]/g, "").trim();
 
     if (groqKey && groqKey !== "YOUR_GROQ_API_KEY") {
       try {

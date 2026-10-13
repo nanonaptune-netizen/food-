@@ -308,9 +308,12 @@ export class VoiceCapture {
       return;
     }
 
-    // Higher bar while the IVR is talking, so its own voice cannot trigger us.
+    // Only a slightly higher bar while the IVR is talking, so its own voice
+    // cannot trigger us. The previous 3.2x / 0.03 bar was so high that a short,
+    // quiet reply ("ಹೌದು", "yes", "sari") spoken over the prompt never registered
+    // at all -- which is why talking while the assistant spoke did nothing.
     const threshold = this.ivrSpeaking
-      ? Math.max(this.noiseFloor * 3.2, 0.03)
+      ? Math.max(this.noiseFloor * 1.9, 0.016)
       : Math.max(this.noiseFloor * 2.4, 0.012);
 
     const isLoud = rms > threshold;
@@ -325,7 +328,12 @@ export class VoiceCapture {
 
     // --- start of an utterance
     if (!this.recording && isLoud) {
-      const holdNeeded = this.ivrSpeaking ? this.opts.bargeInHoldMs : POLL_MS * 2;
+      // Barge-in must stay deliberate (so a cough does not cut the assistant
+      // off) but short enough that a one-word reply counts. 520ms of sustained
+      // speech was too long for "yes" / "ಹೌದು".
+      const holdNeeded = this.ivrSpeaking
+        ? Math.min(this.opts.bargeInHoldMs, 240)
+        : POLL_MS * 2;
       if (this.loudMs >= holdNeeded) {
         if (this.ivrSpeaking) {
           if (!this.opts.allowBargeIn) return;

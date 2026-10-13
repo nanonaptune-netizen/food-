@@ -1,4 +1,5 @@
 import express, { Request } from "express";
+import crypto from "crypto";
 import path from "path";
 import multer from "multer";
 import { v2 as cloudinary } from "cloudinary";
@@ -390,6 +391,138 @@ verifyGroqCredentials();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// ---------------------------------------------------------------------------
+// Admin authentication
+//
+// SECURITY FIX: the dashboard PIN was a constant inside the browser bundle
+// ('0000') and every /api/admin/* route was completely open. One unauthenticated
+// GET returned every citizen's name, phone number, location, complaint text and
+// full IVR call transcript, and the DELETE routes let anyone erase them. The
+// server now verifies the PIN and every privileged route requires a session
+// token, so hiding the dashboard URL is no longer the only protection.
+// ---------------------------------------------------------------------------
+const ADMIN_PIN = (process.env.ADMIN_PIN || "0000").trim();
+const ADMIN_SESSION_MS = 12 * 60 * 60 * 1000; // 12 hours
+const adminSessions = new Map<string, number>();
+
+if (!process.env.ADMIN_PIN) {
+  console.warn("[Admin] ADMIN_PIN is not set - falling back to the default '0000'. Set ADMIN_PIN before deploying.");
+}
+
+function issueAdminToken(): string {
+  const token = crypto.randomBytes(24).toString("hex");
+  adminSessions.set(token, Date.now() + ADMIN_SESSION_MS);
+  return token;
+}
+
+function readAdminToken(req: any): string {
+  const direct = req.headers?.["x-admin-token"];
+  if (typeof direct === "string" && direct.trim()) return direct.trim();
+  const auth = String(req.headers?.authorization || "");
+  const match = /^Bearer\s+(.+)$/i.exec(auth);
+  return match ? match[1].trim() : "";
+}
+
+function pinsMatch(candidate: string): boolean {
+  const a = Buffer.from(String(candidate || ""));
+  const b = Buffer.from(ADMIN_PIN);
+  // timingSafeEqual throws on length mismatch, so check that first.
+  if (a.length !== b.length) return false;
+  try {
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+function requireAdmin(req: any, res: any, next: any) {
+  const token = readAdminToken(req);
+  const expiresAt = token ? adminSessions.get(token) : undefined;
+  if (!expiresAt) {
+    return res.status(401).json({ error: "Admin authentication required" });
+  }
+  if (expiresAt < Date.now()) {
+    adminSessions.delete(token);
+    return res.status(401).json({ error: "Admin session expired. Please sign in again." });
+  }
+  return next();
+}
+
+// Sweep expired sessions so the map cannot grow without bound.
+try {
+  const sweeper = setInterval(() => {
+    const now = Date.now();
+    for (const [token, expiresAt] of adminSessions) {
+      if (expiresAt < now) adminSessions.delete(token);
+    }
+  }, 30 * 60 * 1000);
+  sweeper.unref?.();
+} catch {}
+
+// ---------------------------------------------------------------------------
+// Lightweight per-IP rate limiting
+//
+// These endpoints spend real money (Groq tokens, Cloudinary storage) and had no
+// protection at all, so a single script could burn the account's quota or fill
+// its storage in seconds. Fixed-window counters per IP are enough to stop that,
+// and they also make the admin PIN impractical to brute-force.
+// ---------------------------------------------------------------------------
+function rateLimit(opts: { windowMs: number; max: number; label: string }) {
+  const hits = new Map<string, { count: number; resetAt: number }>();
+
+  try {
+    const sweeper = setInterval(() => {
+      const now = Date.now();
+      for (const [key, entry] of hits) {
+        if (entry.resetAt < now) hits.delete(key);
+      }
+    }, opts.windowMs);
+    sweeper.unref?.();
+  } catch {}
+
+  return (req: any, res: any, next: any) => {
+    const forwarded = String(req.headers?.["x-forwarded-for"] || "").split(",")[0].trim();
+    const ip = forwarded || req.ip || req.socket?.remoteAddress || "unknown";
+    const now = Date.now();
+    const entry = hits.get(ip);
+
+    if (!entry || entry.resetAt < now) {
+      hits.set(ip, { count: 1, resetAt: now + opts.windowMs });
+      return next();
+    }
+    if (entry.count >= opts.max) {
+      const retryAfter = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+      res.setHeader("Retry-After", String(retryAfter));
+      console.warn(`[RateLimit] ${opts.label}: blocked ${ip} for ${retryAfter}s`);
+      return res.status(429).json({ error: "Too many requests. Please slow down and try again shortly." });
+    }
+    entry.count += 1;
+    return next();
+  };
+}
+
+// Brute-forcing a 4-digit PIN takes 10,000 attempts; this makes that hopeless.
+const adminLoginLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, label: "admin-login" });
+const uploadLimit = rateLimit({ windowMs: 10 * 60 * 1000, max: 30, label: "upload" });
+const voiceLimit = rateLimit({ windowMs: 60 * 1000, max: 90, label: "voice" });
+const chatLimit = rateLimit({ windowMs: 60 * 1000, max: 60, label: "chat" });
+
+app.post("/api/admin/login", adminLoginLimit, (req, res) => {
+  const pin = String(req.body?.pin || "").trim();
+  if (!pin) return res.status(400).json({ error: "PIN is required" });
+  if (!pinsMatch(pin)) {
+    console.warn("[Admin] Rejected an admin sign-in attempt.");
+    return res.status(401).json({ error: "Invalid PIN" });
+  }
+  res.json({ token: issueAdminToken(), expiresInMs: ADMIN_SESSION_MS });
+});
+
+app.post("/api/admin/logout", (req, res) => {
+  const token = readAdminToken(req);
+  if (token) adminSessions.delete(token);
+  res.json({ ok: true });
+});
+
 // Twilio Client Setup
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
@@ -589,7 +722,7 @@ const upload = multer({
 });
 
 // API: Upload to Cloudinary (General)
-app.post("/api/upload", upload.single("file"), async (req: any, res) => {
+app.post("/api/upload", uploadLimit, upload.single("file"), async (req: any, res) => {
   try {
     const file = req.file;
     if (!file) return res.status(400).json({ error: "No file provided" });
@@ -608,7 +741,7 @@ app.post("/api/upload", upload.single("file"), async (req: any, res) => {
 });
 
 // API: Upload Voice Note to Cloudinary as MP3
-app.post("/api/upload-audio", upload.single("audio"), async (req: any, res) => {
+app.post("/api/upload-audio", uploadLimit, upload.single("audio"), async (req: any, res) => {
   try {
     const file = req.file;
     if (!file) return res.status(400).json({ error: "No audio file provided" });
@@ -633,7 +766,7 @@ app.post("/api/upload-audio", upload.single("audio"), async (req: any, res) => {
 });
 
 // API: Process PDF or Image with Multimodal OCR & Recognition
-app.post("/api/process-document", upload.single("file"), async (req: MulterRequest, res) => {
+app.post("/api/process-document", requireAdmin, upload.single("file"), async (req: MulterRequest, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded" });
@@ -1040,7 +1173,7 @@ function analyzeCustomerWords(
 }
 
 // API: Chat with Assistant (100% Dynamic AI Generation - No Hardcoded or Cached Answers)
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", chatLimit, async (req, res) => {
   const { message, context, language, profile, history } = req.body;
   if (!message || !message.trim()) {
     return res.status(400).json({ error: "Message is required" });
@@ -1054,6 +1187,35 @@ app.post("/api/chat", async (req, res) => {
 
   // Semantic Memory & Customer Words Analysis across turns
   const analysis = analyzeCustomerWords(queryText, history, {}, langName);
+
+  // ROOT-CAUSE FIX ("it doesn't remember what I said before"): the prompt used to
+  // hand the model only a thin, implicit history, so every turn behaved like the
+  // first one and the assistant asked again for details the caller had already
+  // given. The previously-stated facts and the caller's own earlier words are now
+  // spelled out explicitly in the prompt.
+  const priorUserTurns = (Array.isArray(history) ? history : [])
+    .filter((h: any) => String(h?.role || h?.sender || 'user') !== 'assistant')
+    .map((h: any) => String(h?.content || h?.text || '').trim())
+    .filter(Boolean)
+    // Drop the current message if the client already included it in history.
+    .filter((t: string) => t.toLowerCase() !== queryText.toLowerCase())
+    .slice(-8);
+
+  const knownFacts = [
+    analysis.location ? `Incident location / establishment: ${analysis.location}` : '',
+    analysis.when ? `When it happened: ${analysis.when}` : '',
+    analysis.cause ? `What was wrong: ${analysis.cause}` : '',
+    analysis.item ? `Food item involved: ${analysis.item}` : '',
+    profile?.name ? `Caller name: ${profile.name}` : '',
+    profile?.location ? `Caller city: ${profile.location}` : '',
+  ].filter(Boolean).join('\n');
+
+  const memoryBlock = [
+    knownFacts ? `Details the caller has ALREADY given:\n${knownFacts}` : 'Details the caller has already given: none yet.',
+    priorUserTurns.length
+      ? `The caller's own earlier words this conversation, oldest first:\n- ${priorUserTurns.join('\n- ')}`
+      : '',
+  ].filter(Boolean).join('\n\n');
 
   try {
     let effectiveContext = context || "";
@@ -1102,15 +1264,21 @@ CORE BEHAVIOR INSTRUCTIONS:
 
 4. GRIEVANCE / COMPLAINT REPORTING (Only when user reports a food safety issue):
    - If details are missing (WHERE / WHEN / CAUSE), politely ask ONLY for the missing detail.
+   - NEVER ask again for a detail that appears in the conversation memory below, or that the caller already stated in this conversation. If the location, hotel name, food item, date/time or the cause is already known, treat it as known and move the conversation forward.
+   - Ask for at most ONE genuinely missing detail per turn.
+   - If the caller refers back to something ("that place", "the same problem", "what I told you"), resolve it from the conversation and answer directly instead of asking again.
    - If all details are known (Location: "${analysis.location || ""}", When: "${analysis.when || ""}", Cause: "${analysis.cause || ""}") OR user confirms submission:
      Format the official grievance report in clean Markdown starting with:
      # 📋 Official Food Safety & Inspection Grievance Report
      and ending with COMPLAINT_DRAFT_REQUEST.
 
+=== CONVERSATION MEMORY (this is what makes you sound like a person who was listening) ===
+${memoryBlock}
+
 Always respond warmly, naturally, and directly to what the user actually said.`;
 
     const conversationHistory = Array.isArray(history) && history.length > 0
-      ? history.slice(-6).map((h: any) => ({
+      ? history.slice(-12).map((h: any) => ({
           role: (h.role === "assistant" || h.sender === "assistant") ? "assistant" : "user",
           content: String(h.content || h.text || "")
         }))
@@ -1547,8 +1715,85 @@ function sanitizeIvrReply(text: string, opts: { turnIndex: number; name?: string
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Anchored IVR answer matching
+//
+// ROOT CAUSE of "the IVR keeps asking the same thing": the menu tests below
+// used to be unanchored alternations such as /1|one|kannada|.../i. A bare /1/
+// matches the 1 in "2025" or "₹100", and /one/ matches inside ordinary words
+// like "phone", "someone", "money" and "done". So a caller who simply described
+// their problem ("someone sold me stale food at 7pm") re-triggered the language
+// menu, the welcome prompt was replayed, and the step was reset - the caller
+// had to start over. Every menu answer is now matched against the WHOLE
+// utterance (or a whole word), never a substring.
+// ---------------------------------------------------------------------------
+function ivrNormalize(text: string): string {
+  return String(text || "").trim().toLowerCase().replace(/[\s!.,?;:।"'()]+$/g, "");
+}
+
+/** Whole-utterance DTMF answer: "9", "press 9", "option 9". */
+function matchesIvrDigit(message: string, digit: string): boolean {
+  const t = ivrNormalize(message);
+  if (!t) return false;
+  return new RegExp(`^(?:press\\s+|option\\s+|number\\s+)?${digit}$`).test(t);
+}
+
+/** Latin tokens need \b; Kannada/Devanagari tokens are bounded by their script range. */
+function ivrTokenRegex(token: string): RegExp {
+  if (/^[\u0900-\u097F\u0C80-\u0CFF]+$/.test(token)) {
+    return new RegExp(`(?<![\\u0900-\\u097F\\u0C80-\\u0CFF])${token}(?![\\u0900-\\u097F\\u0C80-\\u0CFF])`);
+  }
+  return new RegExp(`\\b${token}\\b`, "i");
+}
+
+// Whole-word tokens only. "one" is safe here because \bone\b cannot match
+// inside "phone", "someone", "money", "none" or "done".
+const IVR_LANG_TOKENS: Record<string, string[]> = {
+  "kn-IN": ["kannada", "kannad", "ondu", "one", "first", "ಕನ್ನಡ", "ಒಂದು"],
+  "hi-IN": ["hindi", "eradu", "two", "second", "हिंदी", "हिन्दी", "दो", "ಎರಡು"],
+  "en-IN": ["english", "mooru", "three", "third", "ಇಂಗ್ಲಿಷ್", "ಮೂರು", "तीन"],
+};
+
+function matchesIvrLanguageChoice(message: string, digit: string, langCode: string): boolean {
+  if (matchesIvrDigit(message, digit)) return true;
+  const raw = String(message || "");
+  if (!raw) return false;
+  return (IVR_LANG_TOKENS[langCode] || []).some((tok) => ivrTokenRegex(tok).test(raw));
+}
+
+// Whole-utterance confirmation. The old submit test accepted a bare "ha"
+// substring at step press_7_prompt, so any sentence containing "what", "have",
+// "shall" or "harsh" filed the complaint immediately - before the caller had
+// answered anything.
+const IVR_AFFIRM_WORDS = [
+  "confirm", "confirmed", "submit", "yes", "yeah", "yep", "yup", "ok", "okay",
+  "okey", "sure", "done", "proceed", "sari", "sare", "saree", "haan", "han", "ha", "houdu",
+  "ದೃಢೀಕರಿಸಿ", "ಹೌದು", "ಸರಿ", "ಒಂಬತ್ತು",
+  "मंज़ूर", "हाँ", "हां", "पुष्टि", "ठीक", "दर्ज",
+];
+const IVR_AFFIRM_TRAIL = [
+  "please", "it", "do", "that", "thats", "is", "all", "go", "ahead", "to",
+  "submit", "now", "fine", "ok", "okay", "yes", "sir", "madam", "haan",
+  "hai", "है", "करें", "करो",
+];
+
+function isIvrConfirmation(text: string): boolean {
+  const t = ivrNormalize(text);
+  if (!t) return false;
+  const words = t.split(/\s+/).filter(Boolean);
+  if (!words.length) return false;
+  const norm = (w: string) => w.replace(/[^\p{L}\p{N}']/gu, "");
+  const first = norm(words[0]);
+  if (words.length === 1) return IVR_AFFIRM_WORDS.includes(first);
+  if (!IVR_AFFIRM_WORDS.includes(first)) return false;
+  return words.slice(1).every((w) => {
+    const n = norm(w);
+    return !n || IVR_AFFIRM_TRAIL.includes(n) || IVR_AFFIRM_WORDS.includes(n);
+  });
+}
+
 // API: Dedicated Calm & Pleasant IVR Dialogue State Machine
-app.post("/api/ivr/dialogue", async (req, res) => {
+app.post("/api/ivr/dialogue", voiceLimit, async (req, res) => {
   const { 
     message, 
     digits, 
@@ -1575,12 +1820,13 @@ app.post("/api/ivr/dialogue", async (req, res) => {
   let markdownReport = "";
   let raisedComplaintId = "";
 
-  // Explicit Script-based and DTMF language detection
-  if (digits === "1" || (step === "welcome" && (/1|one|kannada|ಕನ್ನಡ|ಒಂದು/i.test(message || "")))) {
+  // Explicit Script-based and DTMF language detection (whole-utterance matches
+  // only - see the anchored IVR matching helpers above).
+  if (digits === "1" || (step === "welcome" && matchesIvrLanguageChoice(message || "", "1", "kn-IN"))) {
     currentLang = "kn-IN";
-  } else if (digits === "2" || (step === "welcome" && (/2|two|hindi|हिंदी|हिन्दी|दो|ಎರಡು/i.test(message || "")))) {
+  } else if (digits === "2" || (step === "welcome" && matchesIvrLanguageChoice(message || "", "2", "hi-IN"))) {
     currentLang = "hi-IN";
-  } else if (digits === "3" || (step === "welcome" && (/3|three|english|ಇಂಗ್ಲಿಷ್|ಮೂರು|तीन/i.test(message || "")))) {
+  } else if (digits === "3" || (step === "welcome" && matchesIvrLanguageChoice(message || "", "3", "en-IN"))) {
     currentLang = "en-IN";
   } else if (message && /[\u0C80-\u0CFF]/.test(message)) {
     currentLang = "kn-IN";
@@ -1596,24 +1842,27 @@ app.post("/api/ivr/dialogue", async (req, res) => {
 
   try {
     // 1. DTMF Language Selection (1 = Kannada, 2 = Hindi, 3 = English)
-    if (digits === "1" || (step === "welcome" && (/1|one|kannada|ಕನ್ನಡ|ಒಂದು/i.test(message || "")))) {
+    //    Whole-utterance matching only, so "someone", "phone", "money", "done"
+    //    or a digit inside a date can never select a language and replay the
+    //    welcome prompt.
+    if (digits === "1" || (step === "welcome" && matchesIvrLanguageChoice(message || "", "1", "kn-IN"))) {
       currentLang = "kn-IN";
       updatedData.language = "kn-IN";
       nextStep = "collecting_info";
       replyText = "ನಮಸ್ಕಾರ! ಆಹಾರ ಸುರಕ್ಷತಾ ಪರಿಶೀಲನೆ ಸಹಾಯವಾಣಿಗೆ ಸ್ವಾಗತ. ದಯವಿಟ್ಟು ತಾವು ಎದುರಿಸಿದ ಆಹಾರ ನೈರ್ಮಲ್ಯ ಅಥವಾ ಕಲುಷಿತ ಆಹಾರದ ದೂರಿನ ಬಗ್ಗೆ ವಿವರವಾಗಿ ತಿಳಿಸಿ. ನಾವು ಸೂಕ್ತ ತನಿಖೆ ನಡೆಸುತ್ತೇವೆ.";
-    } else if (digits === "2" || (step === "welcome" && (/2|two|hindi|हिंदी|हिन्दी|दो|ಎರಡು/i.test(message || "")))) {
+    } else if (digits === "2" || (step === "welcome" && matchesIvrLanguageChoice(message || "", "2", "hi-IN"))) {
       currentLang = "hi-IN";
       updatedData.language = "hi-IN";
       nextStep = "collecting_info";
       replyText = "नमस्ते! खाद्य सुरक्षा एवं निरीक्षण हेल्पलाइन में आपका स्वागत है। कृपया अपनी खाद्य सुरक्षा या स्वच्छता संबंधी शिकायत का विवरण बताएं। हम उचित जांच करेंगे।";
-    } else if (digits === "3" || (step === "welcome" && (/3|three|english|ಇಂಗ್ಲಿಷ್|ಮೂರು|तीन/i.test(message || "")))) {
+    } else if (digits === "3" || (step === "welcome" && matchesIvrLanguageChoice(message || "", "3", "en-IN"))) {
       currentLang = "en-IN";
       updatedData.language = "en-IN";
       nextStep = "collecting_info";
       replyText = "Welcome to the Food Safety & Standards Inspection Authority Helpline. Please describe the food safety, contamination, or hygiene issue you encountered. We will investigate immediately.";
     } 
     // 2. DTMF Key 7: Press 7 for Audio Voice Note Recording
-    else if ((digits === "7" || /7|seven|record|voice note|audio note|ಧ್ವನಿ|ರೆಕಾರ್ಡ್|ಏಳು|ऑडियो|सात/i.test(message || "")) && !isVoiceNote && step !== "ready_for_beep") {
+    else if ((digits === "7" || matchesIvrDigit(message || "", "7") || ivrTokenRegex("seven").test(message || "") || /\b(record|voice note|audio note)\b/i.test(message || "") || ivrTokenRegex("ಧ್ವನಿ").test(message || "") || ivrTokenRegex("ರೆಕಾರ್ಡ್").test(message || "") || ivrTokenRegex("ಏಳು").test(message || "") || ivrTokenRegex("ऑडियो").test(message || "") || ivrTokenRegex("सात").test(message || "")) && !isVoiceNote && step !== "ready_for_beep") {
       nextStep = "ready_for_beep";
       if (isKannada) {
         replyText = "ದಯವಿಟ್ಟು ಬೀಪ್ ಶಬ್ದದ ನಂತರ ತಮ್ಮ ವಿವರವಾದ ಧ್ವನಿ ಸಂದೇಶವನ್ನು ಸ್ಪಷ್ಟವಾಗಿ ಮಾತನಾಡಿ.";
@@ -1688,9 +1937,11 @@ Respond in strict JSON:
     //    a loop of the same prompt.
     else if (
       digits === "9" ||
-      (step === "press_7_prompt" && /9|nine|confirm|yes|submit|sari|ha|ದೃಢೀಕರಿಸಿ|ಒಂಬತ್ತು|दर्ज|पुष्टि|हाँ|नौ/i.test(message || "")) ||
+      matchesIvrDigit(message || "", "9") ||
+      // Deliberately NOT applied at step "welcome": a stray "ok" there must not
+      // file an empty complaint before the caller has even chosen a language.
       ((step === "collecting_info" || step === "press_7_prompt") &&
-        /^(confirm|confirmed|submit|yes|yes please|sari|haan|ha|ok|okay|done|that'?s all|proceed|ದೃಢೀಕರಿಸಿ|ಹೌದು|ಸರಿ|मंज़ूर|हाँ|हां|पुष्टि|ठीक है)[\s!.,।]*$/i.test((message || "").trim()))
+        isIvrConfirmation(message || ""))
     ) {
       nextStep = "submitted";
       isComplaintReady = true;
@@ -2042,7 +2293,7 @@ app.post("/api/ivr/call/end", async (req, res) => {
 });
 
 // API: IVR conversation records for the dashboard / admin review
-app.get("/api/admin/ivr-calls", async (req, res) => {
+app.get("/api/admin/ivr-calls", requireAdmin, async (req, res) => {
   try {
     const turso = getTurso();
     if (!turso) return res.json([]);
@@ -2054,7 +2305,7 @@ app.get("/api/admin/ivr-calls", async (req, res) => {
   }
 });
 
-app.get("/api/admin/ivr-calls/:id", async (req, res) => {
+app.get("/api/admin/ivr-calls/:id", requireAdmin, async (req, res) => {
   try {
     const turso = getTurso();
     if (!turso) return res.status(404).json({ error: "Database not configured" });
@@ -2073,7 +2324,7 @@ app.get("/api/admin/ivr-calls/:id", async (req, res) => {
 });
 
 // API: Neural Text-to-Speech (TTS)
-app.post("/api/tts", async (req, res) => {
+app.post("/api/tts", voiceLimit, async (req, res) => {
   try {
     const { text, language = "kn-IN" } = req.body;
     if (!text || !text.trim()) {
@@ -2123,7 +2374,7 @@ function isHallucinatedTranscript(text: string): boolean {
 }
 
 // API: Speech-to-Text (STT) - Groq Whisper large-v3-turbo
-app.post("/api/stt", upload.single("audio"), async (req: any, res) => {
+app.post("/api/stt", voiceLimit, upload.single("audio"), async (req: any, res) => {
   const startedAt = Date.now();
   try {
     if (!req.file) {
@@ -2195,7 +2446,7 @@ app.post("/api/stt", upload.single("audio"), async (req: any, res) => {
 });
 
 // API: Knowledge Base CRUD (Turso Database)
-app.get("/api/knowledge", async (req, res) => {
+app.get("/api/knowledge", requireAdmin, async (req, res) => {
   try {
     const turso = getTurso();
     if (!turso) return res.json([]);
@@ -2207,7 +2458,7 @@ app.get("/api/knowledge", async (req, res) => {
   }
 });
 
-app.post("/api/knowledge", async (req, res) => {
+app.post("/api/knowledge", requireAdmin, async (req, res) => {
   const { id, name, content, type, createdAt } = req.body;
   const docId = id || Date.now().toString();
   const docCreatedAt = createdAt || Date.now();
@@ -2225,7 +2476,7 @@ app.post("/api/knowledge", async (req, res) => {
   }
 });
 
-app.delete("/api/knowledge/:id", async (req, res) => {
+app.delete("/api/knowledge/:id", requireAdmin, async (req, res) => {
   const { id } = req.params;
   try {
     const turso = getTurso();
@@ -2242,7 +2493,7 @@ app.delete("/api/knowledge/:id", async (req, res) => {
 });
 
 // API: Store Complaint in Turso
-app.post("/api/complaints/add", async (req, res) => {
+app.post("/api/complaints/add", uploadLimit, async (req, res) => {
   const { id, name, phoneNumber, location, query, status, chatHistory, mediaUrls, audioUrl, createdAt, adminReply, adminReplyAt } = req.body;
   
   try {
@@ -2276,24 +2527,44 @@ app.post("/api/complaints/add", async (req, res) => {
 app.get("/api/complaints", async (req, res) => {
   const { phone, id } = req.query;
   try {
+    // Validate the lookup BEFORE touching the database, so a partial phone number
+    // is always refused - even when the DB is unavailable and the handler would
+    // otherwise short-circuit with an empty list.
+    const complaintId = id ? String(id).trim() : '';
+    const cleanPhone = phone ? String(phone).trim() : '';
+    if (complaintId) {
+      if (complaintId.length < 6) {
+        return res.status(400).json({ error: "A valid complaint reference is required" });
+      }
+    } else if (cleanPhone) {
+      if (cleanPhone.replace(/\D/g, "").length < 10) {
+        return res.status(400).json({ error: "Please enter the full phone number you registered with" });
+      }
+    } else {
+      // No lookup key: never leak other citizens' complaints.
+      return res.json([]);
+    }
+
     const turso = getTurso();
     if (!turso) return res.json([]);
-    if (id) {
+    if (complaintId) {
       const result = await turso.execute({
         sql: "SELECT * FROM complaints WHERE id = ? ORDER BY createdAt DESC",
-        args: [id as string],
+        args: [complaintId],
       });
       return res.json(result.rows);
     }
-    if (phone) {
-      const cleanPhone = (phone as string).trim();
+    if (cleanPhone) {
+      // SECURITY FIX: this previously ran `phoneNumber LIKE %<input>%`, so a
+      // one-character query such as ?phone=9 dumped every matching citizen's
+      // complaint details. A full number is now required (validated above).
+      const digits = cleanPhone.replace(/\D/g, "");
       const result = await turso.execute({
-        sql: "SELECT * FROM complaints WHERE phoneNumber = ? OR phoneNumber LIKE ? ORDER BY createdAt DESC",
-        args: [cleanPhone, `%${cleanPhone}%`],
+        sql: "SELECT * FROM complaints WHERE phoneNumber = ? OR phoneNumber = ? ORDER BY createdAt DESC",
+        args: [cleanPhone, digits],
       });
       return res.json(result.rows);
     }
-    // Return empty list if no phone specified to prevent leaking other customers' private complaints
     res.json([]);
   } catch (error: any) {
     console.warn("Error fetching customer complaints:", error.message);
@@ -2301,7 +2572,7 @@ app.get("/api/complaints", async (req, res) => {
   }
 });
 
-app.get("/api/admin/complaints", async (req, res) => {
+app.get("/api/admin/complaints", requireAdmin, async (req, res) => {
   try {
     const turso = getTurso();
     if (!turso) return res.json([]);
@@ -2314,7 +2585,7 @@ app.get("/api/admin/complaints", async (req, res) => {
 });
 
 // Admin: Reply to complaint
-app.post("/api/admin/complaints/:id/reply", async (req, res) => {
+app.post("/api/admin/complaints/:id/reply", requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { reply, status } = req.body;
   try {
@@ -2333,7 +2604,7 @@ app.post("/api/admin/complaints/:id/reply", async (req, res) => {
 });
 
 // Admin: Update status
-app.patch("/api/admin/complaints/:id/status", async (req, res) => {
+app.patch("/api/admin/complaints/:id/status", requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
   try {
@@ -2350,7 +2621,7 @@ app.patch("/api/admin/complaints/:id/status", async (req, res) => {
 });
 
 // Admin: Delete single or batch knowledge entries from Turso
-app.post("/api/knowledge/batch-delete", async (req, res) => {
+app.post("/api/knowledge/batch-delete", requireAdmin, async (req, res) => {
   const { ids } = req.body;
   if (!Array.isArray(ids) || ids.length === 0) {
     return res.status(400).json({ error: "IDs array is required" });
@@ -2371,7 +2642,7 @@ app.post("/api/knowledge/batch-delete", async (req, res) => {
 });
 
 // Admin: Delete complaint
-app.delete("/api/admin/complaints/:id", async (req, res) => {
+app.delete("/api/admin/complaints/:id", requireAdmin, async (req, res) => {
   const { id } = req.params;
   try {
     const turso = getTurso();
@@ -2387,7 +2658,7 @@ app.delete("/api/admin/complaints/:id", async (req, res) => {
 });
 
 // Admin: AI Intelligent Database Erase Evaluator
-app.post("/api/admin/ai-eval-erase", async (req, res) => {
+app.post("/api/admin/ai-eval-erase", requireAdmin, async (req, res) => {
   const { prompt, documents } = req.body;
 
   if (!prompt || !prompt.trim()) {

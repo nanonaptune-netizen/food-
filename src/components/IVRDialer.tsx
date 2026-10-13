@@ -66,6 +66,14 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
   // Voice Note Recording (Press 7 Feature)
   const [isBeepPlaying, setIsBeepPlaying] = useState<boolean>(false);
   const [isRecordingNote, setIsRecordingNote] = useState<boolean>(false);
+  // Same value as the state above, but readable from async callbacks that were
+  // created in an earlier render. Without this, a reply that finished after a
+  // re-render still saw the stale isRecordingNote and skipped re-arming the mic.
+  const isRecordingNoteRef = useRef<boolean>(false);
+  const setRecordingNote = (val: boolean) => {
+    isRecordingNoteRef.current = val;
+    setIsRecordingNote(val);
+  };
   const [recordingSeconds, setRecordingSeconds] = useState<number>(0);
   const [audioNoteUrl, setAudioNoteUrl] = useState<string>('');
 
@@ -221,7 +229,7 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
   // Reset and start silence watch when IVR finishes speaking (45s duration)
   const startSilenceWatch = () => {
     clearSilenceTimers();
-    if (!callActiveRef.current || isRecordingNote) return;
+    if (!callActiveRef.current || isRecordingNoteRef.current) return;
 
     silenceTimerRef.current = setTimeout(() => {
       handleSilenceWarning();
@@ -266,9 +274,19 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
   };
 
   // Interruption Handler: Stop IVR Speaking when user interrupts or hangs up
+  // ROOT-CAUSE FIX (mic went dead after interrupting the assistant): pausing the
+  // audio element and calling speechSynthesis.cancel() never fire onended, so the
+  // handleSpeechEnd() inside speakIVR() never ran and startUserListening() was
+  // never reached - the call went silent until the caller pressed a button.
+  // Re-arming listening here closes that hole for every interrupt path.
   const interruptSpeaking = () => {
     initialGreetingActiveRef.current = false;
     stopSpeechOnly();
+    clearSilenceTimers();
+    if (callActiveRef.current && !isRecordingNoteRef.current) {
+      processingSpeechRef.current = false;
+      startUserListening();
+    }
   };
 
   // Browser Web Speech API TTS
@@ -369,7 +387,7 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
     const cleanPrompt = stripEmojis(text);
     if (!cleanPrompt) {
       if (onFinish) onFinish();
-      if (shouldStartListening && callActiveRef.current && !isRecordingNote) {
+      if (shouldStartListening && callActiveRef.current && !isRecordingNoteRef.current) {
         startUserListening();
       }
       return;
@@ -391,7 +409,7 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
       if (onFinish) {
         onFinish();
       }
-      if (shouldStartListening && callActiveRef.current && !isRecordingNote) {
+      if (shouldStartListening && callActiveRef.current && !isRecordingNoteRef.current) {
         startUserListening();
         startSilenceWatch();
       }
@@ -529,7 +547,7 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
         getLanguage: () => languageRef.current,
         transcribe: transcribeUtterance,
         onUtterance: (transcript) => {
-          if (!callActiveRef.current || isRecordingNote) return;
+          if (!callActiveRef.current || isRecordingNoteRef.current) return;
           clearSilenceTimers();
 
           if (processingSpeechRef.current) {
@@ -568,7 +586,7 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
   // Start / resume listening. The microphone is opened once per call and kept
   // warm, so the recogniser is ready the instant the assistant stops speaking.
   const startUserListening = () => {
-    if (!callActiveRef.current || isRecordingNote) return;
+    if (!callActiveRef.current || isRecordingNoteRef.current) return;
     processingSpeechRef.current = false;
     const engine = getVoiceEngine();
     engine.setIvrSpeaking(isIvrSpeakingRef.current);
@@ -729,7 +747,7 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
     dialogueHistoryRef.current = [];
     setCallActive(false);
     setIsListening(false);
-    setIsRecordingNote(false);
+    setRecordingNote(false);
     setCallerSpeaking(false);
     setMicLevel(0);
     setStatusMessage('Call Ended');
@@ -888,7 +906,7 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
       };
 
       mediaRecorder.start(250);
-      setIsRecordingNote(true);
+      setRecordingNote(true);
       setRecordingSeconds(0);
 
       if (noteTimerRef.current) clearInterval(noteTimerRef.current);
@@ -906,7 +924,7 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
       mediaRecorderRef.current.stop();
     }
     if (noteTimerRef.current) clearInterval(noteTimerRef.current);
-    setIsRecordingNote(false);
+    setRecordingNote(false);
   };
 
   // Transcribe recorded voice with STT, upload audio file, and react in IVR

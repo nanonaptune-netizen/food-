@@ -1,3 +1,11 @@
+# ===========================================================================
+# DEPRECATED - DO NOT RUN.
+#
+# One-off migration script that has ALREADY been applied. Re-running it will
+# silently undo later fixes, because it rewrites whole function bodies by
+# string matching. patch_va.py in particular re-introduces the transcript
+# doubling bug. Kept for historical reference only.
+# ===========================================================================
 import re
 
 with open("server.ts", "r") as f:

@@ -17,6 +17,7 @@ export default function TrackComplaints({ profile, onOpenProfile }: TrackComplai
   const [complaints, setComplaints] = useState<Complaint[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string>('');
 
   const fetchComplaints = async () => {
     if (!profile.phone || !profile.phone.trim()) {
@@ -25,11 +26,21 @@ export default function TrackComplaints({ profile, onOpenProfile }: TrackComplai
     }
 
     setIsLoading(true);
+    setLoadError('');
     try {
       const url = `/api/complaints?phone=${encodeURIComponent(profile.phone.trim())}`;
       const res = await fetch(url);
       const data = await res.json();
-      
+
+      // The lookup requires the FULL phone number (it used to accept a partial
+      // number, which leaked other citizens' complaints). Surface the reason
+      // instead of silently showing "no complaints".
+      if (!res.ok) {
+        setLoadError(String(data?.error || 'Could not load your complaints.'));
+        setComplaints([]);
+        return;
+      }
+
       if (Array.isArray(data)) {
         const formatted: Complaint[] = data.map((item: any) => {
           let parsedChat: VoiceInteraction[] = [];
@@ -101,6 +112,14 @@ export default function TrackComplaints({ profile, onOpenProfile }: TrackComplai
           Viewing all complaints and official resolutions registered under your phone number.
         </p>
       </div>
+
+      {/* Complaints load error */}
+      {loadError && (
+        <div className="bg-amber-50 border border-amber-200 text-amber-900 rounded-2xl p-3 flex items-start gap-2 text-xs font-semibold">
+          <AlertCircle size={15} className="text-amber-600 shrink-0 mt-0.5" />
+          <span className="flex-1">{loadError}</span>
+        </div>
+      )}
 
       {/* Profile Phone Status Card */}
       {profile.phone ? (

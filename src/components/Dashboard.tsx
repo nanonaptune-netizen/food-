@@ -8,6 +8,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { Complaint, VoiceInteraction } from '../types';
 import { RenderedMarkdown } from './RenderedMarkdown';
+import { adminFetch } from '../lib/adminAuth';
 
 export default function Dashboard() {
   const [complaints, setComplaints] = useState<Complaint[]>([]);
@@ -23,7 +24,7 @@ export default function Dashboard() {
   const fetchComplaints = async () => {
     setIsLoading(true);
     try {
-      const res = await fetch('/api/admin/complaints');
+      const res = await adminFetch('/api/admin/complaints');
       const data = await res.json();
       if (Array.isArray(data)) {
         const formatted: Complaint[] = data.map((row: any) => {
@@ -68,7 +69,7 @@ export default function Dashboard() {
 
     setIsSubmittingReply(true);
     try {
-      const res = await fetch(`/api/admin/complaints/${selectedComplaint.id}/reply`, {
+      const res = await adminFetch(`/api/admin/complaints/${selectedComplaint.id}/reply`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -105,7 +106,7 @@ export default function Dashboard() {
 
   const updateComplaintStatusDirectly = async (id: string, newStatus: 'pending' | 'under_review' | 'resolved') => {
     try {
-      await fetch(`/api/admin/complaints/${id}/status`, {
+      await adminFetch(`/api/admin/complaints/${id}/status`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status: newStatus }),
@@ -123,7 +124,7 @@ export default function Dashboard() {
   const deleteComplaint = async (id: string) => {
     if (!window.confirm("Are you sure you want to delete this complaint record?")) return;
     try {
-      await fetch(`/api/admin/complaints/${id}`, { method: 'DELETE' });
+      await adminFetch(`/api/admin/complaints/${id}`, { method: 'DELETE' });
       setComplaints(prev => prev.filter(c => c.id !== id));
       if (selectedComplaint?.id === id) {
         setSelectedComplaint(null);
