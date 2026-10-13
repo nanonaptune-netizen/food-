@@ -10,7 +10,7 @@ import {
 } from 'lucide-react';
 import { UserProfile } from '../types';
 import { Link } from 'react-router-dom';
-import { stripEmojis } from '../utils/text';
+import { stripEmojis, collapseRepetitions } from '../utils/text';
 import { VoiceCapture, VoiceLang } from '../lib/voiceCapture';
 
 interface IVRDialerProps {
@@ -434,13 +434,11 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
       }
     }
 
-    // 2ND PRIORITY: Browser Google Web Speech API
-    const spokeWithBrowser = speakWithBrowserGoogle(cleanPrompt, effectiveLang, handleSpeechEnd);
-    if (spokeWithBrowser) {
-      return;
-    }
-
-    // 3RD PRIORITY: /api/tts fallback fetch
+    // 2ND PRIORITY: the neural /api/tts voice. The on-device browser voice used
+    // to be tried FIRST, so a robotic SAPI voice spoke whenever the pre-generated
+    // audio was missing (for example when the /api/ivr/dialogue TTS race was
+    // lost). fallbackSpeech tries the neural endpoint first and only drops to the
+    // on-device voice if that genuinely fails.
     fallbackSpeech(cleanPrompt, effectiveLang, handleSpeechEnd);
   };
 
@@ -476,17 +474,9 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
       console.warn("Fallback /api/tts request notice:", apiErr);
     }
 
-    // Direct browser synthesis attempt
-    try {
-      if (window.speechSynthesis) {
-        const utt = new SpeechSynthesisUtterance(cleanText);
-        utt.lang = targetLang;
-        utt.onend = () => onEnd();
-        utt.onerror = () => onEnd();
-        window.speechSynthesis.speak(utt);
-        return;
-      }
-    } catch {}
+    // Direct browser synthesis attempt - genuine last resort only.
+    console.warn("Neural voice unavailable - falling back to the on-device browser voice.");
+    if (speakWithBrowserGoogle(cleanText, targetLang, onEnd)) return;
 
     onEnd();
   };
@@ -789,7 +779,13 @@ export const IVRDialer: React.FC<IVRDialerProps> = ({ profile }) => {
   const handleCallerSpeech = (text: string) => {
     if (!text || !text.trim()) return;
     clearSilenceTimers();
-    sendIVRInput({ message: text });
+    // Collapse repeated copies before anything downstream sees the words: a
+    // replayed clip is re-transcribed several times, and "yes yes yes" could
+    // otherwise trip the confirmation branch more than once.
+    const cleaned = collapseRepetitions(text).trim();
+    if (!cleaned) return;
+    setLastCallerSpoken(cleaned);
+    sendIVRInput({ message: cleaned });
   };
 
   // Central IVR State Transition Caller

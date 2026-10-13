@@ -17,14 +17,108 @@ export function stripEmojis(text: string): string {
 }
 
 /**
+ * Repairs the recogniser's digit-homophone mistakes.
+ *
+ * ROOT CAUSE of "I said I ate food but the caption says I 8 food": speech models
+ * emit the digit for a word that sounds the same ("ate" -> 8, "for" -> 4,
+ * "to" -> 2) when the clip is short or slightly unclear. Nothing else in the
+ * pipeline was pulling those back, so the digit reached the caption and the chat.
+ *
+ * Every rule is anchored so a REAL quantity is never touched. "I ate at 8 pm",
+ * "8 idlis", "2 dosas", "₹200", "room 8" and "8 o'clock" are all left alone -
+ * quantities matter in a complaint, so this errs on the side of changing nothing.
+ * Verified by test-repetition-collapse.ts.
+ */
+const DIGIT_HOMOPHONE_RULES: Array<[RegExp, string]> = [
+  // PROTECT FIRST: a "8" that follows a preposition or a place/number identifier
+  // is a genuine time or number, never the verb "ate". Spelling it out makes it
+  // impossible for the rules below to touch it, and keeps the meaning intact
+  // ("at 8 the food was cold" must NOT become "ate the food was cold").
+  [/\b(at|on|by|around|about|after|before|till|until|from|till)\s+8\b/gi, '$1 eight'],
+  [/\b(room|flat|door|table|gate|bus|train|floor|shop|plot|seat|no|number|token|slip)\s+8\b/gi, '$1 eight'],
+  // "I 8" / "we 8" / "they 8" -> "I ate" ... (a pronoun followed by a bare 8 is
+  // never a quantity)
+  [/\b(I|we|they|he|she|you|i)\s+8\b/g, '$1 ate'],
+  // "8 the rice", "8 my lunch" -> "ate the rice", "ate my lunch"
+  [/\b8\s+(the|my|our|his|her|their|some)\b/gi, 'ate $1'],
+  // "8 food" -> "ate food" (singular food/meal nouns only; "8 idlis" is a
+  // quantity and is deliberately not matched)
+  [/\b8\s+(food|meal|breakfast|lunch|dinner|snack|rice|curd|sambar|something)\b/gi, 'ate $1'],
+  // "4 me" -> "for me"
+  [/\b4\s+(me|you|us|them|him|this|that)\b/gi, 'for $1'],
+  // "2 me" -> "to me"
+  [/\b2\s+(me|you|us|them|him|her)\b/gi, 'to $1'],
+  // "want 2 go" -> "want to go"
+  [/\b(want|wanted|need|needed|going|go|try|tried|like|liked|have|has|had|use|used|eat|ate)\s+2\s+([a-z])/gi, '$1 to $2'],
+];
+
+export function normalizeRecognizedText(text: string): string {
+  let out = String(text || '');
+  if (!out) return '';
+  for (const [pattern, replacement] of DIGIT_HOMOPHONE_RULES) {
+    out = out.replace(pattern, replacement);
+  }
+  return out.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Collapses a phrase that has been repeated N times into ONE copy.
+ *
+ * ROOT CAUSE of "I said 3 words and it showed them 3 to 7 times": recognisers
+ * replay the same audio across their silent end/restart cycles, and a replayed
+ * clip is re-transcribed with small differences each time, so a single utterance
+ * arrives as several near-identical copies. The existing exact-match dedupe could
+ * not see those; this finds the repeating period and keeps one copy.
+ */
+export function collapseRepetitions(text: string): string {
+  const words = String(text || '').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+  if (words.length < 2) return words.join(' ');
+
+  // Case- and punctuation-insensitive comparison, so "ರುಚಿ," and "ರುಚಿ" match.
+  const norm = words.map((w) => w.toLowerCase().replace(/[^\p{L}\p{N}]/gu, ''));
+
+  // 1. Exact period: the whole sequence is the same k words repeated N times.
+  for (let period = 1; period <= Math.floor(words.length / 2); period++) {
+    if (words.length % period !== 0) continue;
+    let periodic = true;
+    for (let i = period; i < words.length; i++) {
+      if (norm[i] !== norm[i % period]) {
+        periodic = false;
+        break;
+      }
+    }
+    if (periodic) return words.slice(0, period).join(' ');
+  }
+
+  // 2. Near-exact period: a replayed clip comes back slightly different each
+  //    time, so accept a copy whose words are >= 80% positionally equal.
+  for (let copies = 8; copies >= 2; copies--) {
+    if (words.length % copies !== 0) continue;
+    const unit = words.length / copies;
+    let repeated = true;
+    for (let c = 1; c < copies && repeated; c++) {
+      let same = 0;
+      for (let i = 0; i < unit; i++) {
+        if (norm[i] === norm[i + c * unit]) same++;
+      }
+      if (same / unit < 0.8) repeated = false;
+    }
+    if (repeated) return words.slice(0, unit).join(' ');
+  }
+
+  return words.join(' ');
+}
+
+/**
  * Normalizes speech recognition text and removes consecutive repeated words or phrases
  * across all languages (Kannada, Hindi, English).
  */
 export function cleanSpeechTranscript(text: string): string {
   if (!text) return '';
-  
-  // 1. Normalize spaces and whitespace
-  let clean = text.replace(/\s+/g, ' ').trim();
+
+  // 1. Collapse whole-phrase repetition first (exact AND near-exact), so N copies
+  //    of one sentence never reach the caption, the chat or the LLM prompt.
+  let clean = collapseRepetitions(text).replace(/\s+/g, ' ').trim();
   if (!clean) return '';
 
   // 2. Tokenize by spaces (preserves full Unicode characters for Kannada & Hindi)

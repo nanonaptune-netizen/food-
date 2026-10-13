@@ -226,3 +226,355 @@ Verified: the 9th rapid wrong-PIN attempt onward returns **429**.
 | `server.ts` | Admin sessions + `requireAdmin` on 12 routes, rate limiting, exact-match complaint lookup, anchored IVR matching, conversation memory, credentials removed |
 | `.env.example` | Live credentials replaced with placeholders; `ADMIN_PIN` documented |
 | `patch_*.py` | Hard-coded Groq key removed; deprecated banners added |
+
+---
+
+# Round 3 — natural voices, accurate captions, real memory
+
+Covers: "you're not using any microsoft neural voices", "it's not memorized what I
+said", "Kannada: understand perfectly but captions are incorrect", "if talking about
+idli … it asked what you eat?", "I asked tell me what I said but it said I don't
+know", and "voice in three languages must be natural".
+
+## 10. The neural voices worked all along — the client never used them
+
+I tested the existing Edge TTS directly: `kn-IN-SapnaNeural`, `hi-IN-SwaraNeural` and
+`en-IN-NeerjaNeural` all synthesise real audio (~0.9–1.5 s per sentence, 322 voices
+available). So the voice engine was never the problem — **tier ordering was**:
+
+- `VoiceAssistant.speak()` tried the browser's `speechSynthesis` **first**, and it
+  claimed *every* English reply. So the robotic on-device SAPI voice spoke instead of
+  the neural one, and the neural audio that `/api/chat` had already generated was
+  thrown away.
+- `IVRDialer.speakIVR()` tried the browser voice **second**, ahead of `/api/tts` — so
+  whenever the `/api/ivr/dialogue` TTS race was lost, the call dropped to the robotic
+  voice too.
+
+**Fix** — neural audio is now tried first on both surfaces:
+`audioUrl` → `/api/tts` (cached per language+text, bounded to 40 entries) → on-device
+voice as a logged last resort. Interrupting bumps a generation counter so an
+in-flight TTS fetch from a cancelled turn can never start playing late.
+
+Verified against the running server:
+
+```
+Kannada  -> 22608 bytes (906ms)
+Hindi    -> 23616 bytes (912ms)
+English  -> 29808 bytes (1550ms)
+```
+
+## 11. Captions were wrong because the browser recogniser was the caption
+
+`src/components/VoiceAssistant.tsx` used the browser Web Speech API as both the
+**dispatched transcript** and the **on-screen caption**. Your own
+`speech-api-research.md` records that `recognition.lang = 'kn-IN'` is silently ignored
+on desktop Chrome — so Kannada captions were garbled, exactly as you described.
+
+Worse, the silence timer that *sends* a turn lived inside `recognition.onresult`. When
+the recogniser returns nothing — the normal case for Kannada on desktop — **the turn
+was never dispatched at all**.
+
+**Fix**
+- Each utterance is recorded from the single persistent microphone stream, and
+  **server Whisper is now the authoritative transcript** for both the caption and the
+  dispatched text; the browser text is only a fallback.
+- Turn-taking is driven by **real microphone energy** (RMS VAD: send after 2.5 s of
+  silence once speech was detected, hard cap at 20 s), which behaves identically in all
+  three languages and no longer depends on `onresult` firing.
+
+## 12. Real memory, and "what did I say?" can no longer fail
+
+The chat was stateless: memory was whatever the browser chose to resend, and the
+assistant had **never been given the transcript**, so "what did I say?" was answered
+from nothing.
+
+**Fix**
+- Conversations are stored **server-side** (Turso `conversations` table, in-memory
+  fallback, 40-turn cap), keyed by a `conversationId` the client persists in
+  `localStorage`. Memory now survives a reload and many turns.
+- Facts are derived from the **whole stored conversation**, not the browser's window —
+  this is what stops "I said idli" being followed by "what did you eat?".
+- The prompt now carries a `FACTS ALREADY ESTABLISHED (treat as known, never ask
+  again)` ledger plus your own recent replies marked *do NOT repeat these questions*,
+  and the food item is now part of the known-details list.
+- **Deterministic recall**: "what did I say / ನಾನು ಏನು ಹೇಳಿದೆ / मैंने क्या कहा" is
+  answered from the stored turns verbatim — no model guess, so it cannot say "I don't
+  know".
+
+Verified over HTTP with correct UTF-8, in all four phrasings:
+
+```
+[Kannada] "ನಾನು ಏನು ಹೇಳಿದೆ"        recalled=true  containsCallerWords=true
+[Kannada] "ನನ್ನ ಮಾತು ನೆನಪಿದೆಯಾ"    recalled=true  containsCallerWords=true
+[Hindi]   "मैंने क्या कहा"           recalled=true  containsCallerWords=true
+[English] "what did I say"          recalled=true  containsCallerWords=true
+```
+
+## 13. Better STT for Indic languages
+
+`/api/stt` used one model for everything: `whisper-large-v3-turbo`, which is distilled
+for English. **Fix:** a per-language chain — Kannada and Hindi prefer
+`whisper-large-v3` (materially better Indic accuracy), English keeps `-turbo` for
+latency, and each falls back to the other. The decoder is now always seeded with a
+domain lexicon in the target script (food items, hotel words, FSSAI terms, complaint
+vocabulary) instead of relying on a short IVR-only hint, and the startup credential
+check validates **both** STT models so an unavailable one fails loudly instead of
+silently degrading captions. `/api/stt` now reports which model produced the text.
+
+## How close this is to a "live" conversation
+
+Implemented: hands-free turn taking from real audio energy, automatic re-arming of
+listening the moment the assistant stops speaking, barge-in (start talking and it stops
+mid-sentence), and neural voice output in all three languages.
+
+**Not implemented, and worth being clear about:** true full-duplex streaming. Replies
+are still synthesised as a whole sentence rather than streamed token-by-token, so
+time-to-first-word is ~1–2 s rather than the near-instant feel of a native live
+conversation. Doing that properly means streaming the LLM output and speaking it
+sentence-by-sentence as it arrives — a larger change I did not want to fold into this
+round without your go-ahead.
+
+## Verified vs not verified
+
+Verified locally against the running server: neural TTS in 3 languages, deterministic
+recall in 3 languages, memory surviving a client that resends no history, the anchored
+IVR matching, the rate limiter, and all admin/PII endpoints returning 401.
+
+**Not verified locally:** the model's *adherence* to the facts ledger (i.e. that it
+stops asking "what did you eat?") — `GROQ_API_KEY` is not set in this environment, so
+no LLM call could run here. The transcript it receives is verified correct; the
+behaviour depends on the deployed model. Worth confirming on your deployment.
+
+## Files changed in this round
+
+| File | Change |
+|---|---|
+| `server.ts` | Per-language STT chains + domain hints, expanded startup model check, conversations table, memory-aware `/api/chat`, deterministic recall, food item added to the known-details ledger |
+| `src/components/VoiceAssistant.tsx` | Neural-first TTS with bounded cache + generation-cancelled fetches, Whisper-authoritative captions, energy-based turn detection, single persistent mic stream for orb + recording, per-language STT hints, persistent conversationId |
+| `src/components/IVRDialer.tsx` | Neural `/api/tts` tried before the on-device voice |
+
+---
+
+# Round 4 — why one utterance came back 3 to 7 times
+
+The question was: *"if I talked 3 words but it displayed 3 to 7 times … why not
+understanding single word single time?"* There are **two independent multipliers**, and
+the reason it survived Round 3 is that nothing collapsed repetition on the paths that
+actually ship text.
+
+## 14. Multiplier A — the recogniser re-delivers the same audio, and near-exact copies slipped through
+
+Chrome ends continuous recognition by itself after a pause, and `onend` restarts it —
+which **re-feeds the buffered audio**. So one utterance is transcribed again on each
+restart cycle.
+
+`cleanSpeechTranscript()` *did* already collapse repeats, but only **exact** ones: it
+compares normalised phrases for strict equality. A replayed clip is re-transcribed
+*slightly differently* each time (a word ending, a syllable, punctuation), so the copies
+never matched and every cycle appended another copy. Your "3 words, 3 to 7 times" is
+exactly this: 2 copies, then 3, then more, each one a hair different from the last.
+
+**Fix** — new `collapseRepetitions()` in [src/utils/text.ts](src/utils/text.ts) finds the
+**repeating period** rather than matching copies literally:
+
+- *Exact period*: the whole sequence is the same k words repeated N times
+  (`words.length % period === 0` and `norm[i] === norm[i % period]`) → keep one period.
+- *Near-exact period*: accept a copy whose words are **≥80% positionally equal**, which
+  catches the slightly-different re-transcriptions.
+
+It runs first inside `cleanSpeechTranscript()`, so every existing caller
+(`mergeTranscripts`, the live caption, the IVR echo) inherits it.
+
+## 15. Multiplier B — the authoritative paths had NO collapsing at all
+
+This is the bigger one, and it is why the symptom persisted:
+
+- `/api/stt` returned Whisper's text **completely raw**, so any repetition the model
+  produced went straight into the caption *and* the chat message *and* the LLM prompt
+  (which then mirrored it back).
+- `stopListeningAndSend()` dispatched `serverText` raw for the same reason.
+- If server STT returned nothing (no key, quota, or hallucination-filtered), the code
+  **silently fell back to the accumulated browser string** — the very string that had
+  been accumulating the extra copies. So the repeats appeared in both places at once.
+
+**Fix**
+- `/api/stt` collapses before returning.
+- **Whisper loop retry**: a long decoder prompt conditioned on silence is the classic
+  trigger for Whisper repetition loops, so when the first result `looksRepetitive()` the
+  request is **re-sent without the prompt** and the non-repetitive result wins.
+- `/api/chat` and `/api/ivr/dialogue` collapse their incoming message, so the model never
+  sees `idli idli idli` and memory stores the clean sentence.
+- The client collapses the caption, the Whisper result, and the browser fallback.
+
+## 16. Two more things that were adding copies
+
+- **Double dispatch.** The energy turn detector and the recogniser's own 3.5 s silence
+  timer could BOTH fire for one utterance; the second entry found an already-stopped
+  recorder, fell through to the browser text, and appended **another identical user
+  message**. Now guarded by a per-turn `turnDispatchedRef`.
+- **Cross-turn audio contamination.** `stop()` flushes a final `dataavailable`
+  asynchronously, and every recorder pushed into one **shared** chunk array — so a late
+  flush from the previous turn landed in the *next* turn's recording. Each recorder now
+  owns its own buffer, and transcription pins the buffer it was armed with.
+
+## Verification
+
+Deterministic regression test — [test-repetition-collapse.ts](test-repetition-collapse.ts),
+run with `npx tsx test-repetition-collapse.ts`:
+
+```
+--- exact copies of a 3-word utterance (Kannada) ---
+PASS  2x / 3x / 4x / 5x / 6x / 7x / 8x "ಇಡ್ಲಿ ತುಂಬಾ ರುಚಿ"
+--- near-exact copies (re-transcribed slightly differently) ---
+PASS  3x near-exact mixed        PASS  5x near-exact mixed
+--- single word repeated ---
+PASS  7x "ಇಡ್ಲಿ"                 PASS  5x "yes"
+--- English utterance repeated ---
+PASS  3x "I ate idli"            PASS  2x "hello world"      PASS  4x "the worm was"
+--- non-repetitive text must pass through untouched ---
+PASS  normal Kannada / English / Hindi sentences
+PASS  non-adjacent repeats ("one two one two three")
+PASS  50% and 75% similar halves (must NOT collapse)
+=== 30 passed, 0 failed ===
+```
+
+The no-false-positive cases matter as much as the fixes: a legitimate Kannada sentence,
+a sentence with a word repeated in a non-adjacent position, and half-similar halves all
+pass through **unchanged**, so collapsing cannot damage normal speech.
+
+`tsc --noEmit` is clean on every edited file (only the pre-existing `firebase.ts` errors
+remain) and the production build passes (2293 modules, `collapseRepetitions` present in
+both the frontend and server bundles).
+
+## Files changed in this round
+
+| File | Change |
+|---|---|
+| `src/utils/text.ts` | New `collapseRepetitions()` (exact + near-exact period detection), applied first inside `cleanSpeechTranscript()` |
+| `src/components/VoiceAssistant.tsx` | Collapsing on caption + Whisper result + browser fallback, single-dispatch guard, per-recorder chunk buffers |
+| `src/components/IVRDialer.tsx` | Caller text collapsed before display and dispatch |
+| `server.ts` | `collapseRepetitions()`/`looksRepetitive()`, collapse in `/api/stt` with a repetition-triggered prompt retry, collapse of incoming messages in `/api/chat` and `/api/ivr/dialogue` |
+| `test-repetition-collapse.ts` | New — 30-case regression test for the repeated-word bug |
+
+---
+
+# Round 5 — caller-scoped memory, one shared memory, New conversation, and "I 8 food"
+
+## 17. Your privacy question drove the whole design
+
+You asked whether one user's information is ever discussed with another. It now
+cannot be, and that is **enforced on the server**, not by hiding things in the UI:
+
+- Every conversation row has an **owner** (`phone`).
+- `loadConversation(id, phone)` returns a thread **only when the stored owner matches
+  the caller**. Presenting someone else's conversation id is refused and logged
+  (`[Memory] Refused to serve a conversation owned by a different phone number.`), and
+  that caller gets a fresh, empty conversation.
+- An unrecognised id may be **reused only if it is genuinely free**. An id that already
+  belongs to another caller is never taken over — otherwise a stranger could have
+  claimed (and overwritten) someone else's thread just by guessing an id.
+- A caller with **no phone number** is treated as "different" from any registered owner,
+  so an anonymous session can never claim a thread that belongs to someone.
+
+I built this into the memory layer *before* the convenience features, because adding
+cross-device memory without ownership checks is exactly how one person's complaint ends
+up in another person's transcript.
+
+Verified against the running server — [test-memory-isolation.mjs](test-memory-isolation.mjs)
+(`node test-memory-isolation.mjs`, needs the dev server running):
+
+```
+PASS  A can store a turn
+PASS  B with A's conversationId sees NOTHING
+PASS  B's reply contains no A content
+PASS  A with their own id CAN read it
+PASS  A on a new device resumes their own memory
+PASS  B with no id has no history to adopt
+PASS  a fresh id after closing starts empty
+PASS  the closed thread is never resurrected
+PASS  B cannot close or break A's thread
+=== isolation: 9 passed, 0 failed ===
+```
+
+## 18. Memory now follows the caller, not the browser
+
+`conversations.phone` + `findLatestConversationForPhone()` let a returning caller
+continue their own thread from a new device. The client no longer invents an id on first
+run: sending **no** id is the "I have nothing stored here" signal that triggers adoption
+of the caller's own latest open thread. An id the server does not recognise instead means
+"start fresh" — which is what the New conversation button does.
+
+## 19. One memory across both surfaces
+
+- `/api/chat` now injects the caller's **recent phone-call history** (last 3 calls and
+  last 3 complaints, via the existing `loadCallerMemory`) into the prompt.
+- `/api/ivr/dialogue` now injects what the caller already said on the **website chat**
+  via the new `loadWebChatCallerMemory()` — compact derived facts (issue, food, place,
+  when), never the raw transcript of another thread.
+
+Both are keyed by phone number only, so the sharing is between *a caller's own*
+sessions, never between callers.
+
+## 20. New conversation
+
+A `+` control in the chat header. It closes the old thread server-side
+(`POST /api/chat/new`), rotates the id, clears the messages, the reply cache and the
+in-flight listening state. Verified: a fresh id afterwards starts empty, and the closed
+thread is not resurrected by the "latest open thread" lookup.
+
+## 21. Why the caption said "I 8 food"
+
+Speech models emit the **digit for a word that sounds the same** — "ate" → `8`,
+"for" → `4`, "to" → `2` — when the clip is short or slightly unclear. Nothing in the
+pipeline was pulling those back, and our decoder prompt listed food vocabulary but **no
+verbs**, so there was nothing biasing the model toward "ate".
+
+Two fixes:
+1. **Prompt bias** — the English STT hint now leads with the verbs
+   (*"I ate, we ate, had, ordered, drank…"*).
+2. **A conservative corrector**, `normalizeRecognizedText()`, applied to the final
+   transcript on both server and client. It only rewrites a digit where a quantity
+   cannot be meant — and it **protects real numbers first**: an `8` after a preposition
+   or an identifier (`at 8`, `room 8`, `table 8`, `on 8 August`) is spelled out so the
+   later rules physically cannot touch it.
+
+```
+PASS  "I 8 food" -> "I ate food"          PASS  "we 8 breakfast" -> "we ate breakfast"
+PASS  "8 my lunch" -> "ate my lunch"      PASS  "I want 2 go" -> "I want to go"
+PASS  "I 8 at 8 pm" -> "I ate at eight pm"
+--- real quantities left alone ---
+PASS  "8 idlis were served"    PASS  "2 dosas and 4 vadas"    PASS  "I paid 200 rupees"
+PASS  "at 8 the food was cold" -> "at eight the food was cold"   (meaning preserved)
+PASS  "room 8 was dirty" -> "room eight was dirty"    PASS  "I waited 9 minutes"
+```
+
+`test-repetition-collapse.ts` is 52 cases, all passing.
+
+## Verification summary for this round
+
+| Check | Result |
+|---|---|
+| `tsc --noEmit` (all edited files) | clean (only the pre-existing `firebase.ts` errors) |
+| `npm run build` | passes (frontend + server bundle) |
+| `test-repetition-collapse.ts` | 52 / 52 |
+| `test-memory-isolation.mjs` | 9 / 9 |
+
+## Files changed in this round
+
+| File | Change |
+|---|---|
+| `server.ts` | `phone` owner column + index, ownership-enforced `loadConversation`, `isConversationOwnedByOther`, `findLatestConversationForPhone`, `closeConversation`, `POST /api/chat/new`, cross-surface memory both ways, digit-homophone correction, verb-led English STT hint |
+| `src/components/VoiceAssistant.tsx` | New conversation control + `startNewConversation()`, conversation id no longer invented client-side, homophone correction applied to the final transcript |
+| `src/utils/text.ts` | `normalizeRecognizedText()` with quantity protection |
+| `test-repetition-collapse.ts` | Extended to 52 cases (repetition, homophones, quantity protection) |
+| `test-memory-isolation.mjs` | New — 9-case cross-caller privacy regression test |
+
+## Still open, stated plainly
+
+- **A known phone number is still enough to read that person's complaints** via
+  `GET /api/complaints?phone=…`. It now needs the full 10-digit number (a partial one is
+  refused), but there is no ownership proof. Real protection needs a one-time code sent
+  to the phone. That needs an SMS provider and a UX decision, so I have not changed it.
+- Shared-device caveat: if two people use the same browser and the *same phone number* is
+  configured in the profile, the second person sees the first's thread — the app has one
+  profile per install. Different phone numbers are now fully separated.

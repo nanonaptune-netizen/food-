@@ -27,7 +27,30 @@ function getGroqKey(): string {
 // So the fastest model leads the chain on live voice turns.
 const GROQ_VOICE_MODELS = ["qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"];
 const GROQ_TEXT_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"];
-const GROQ_STT_MODEL = "whisper-large-v3-turbo";
+// Speech-to-text chains, per language. whisper-large-v3 is noticeably more
+// accurate on Kannada and Hindi than the distilled -turbo variant (which is
+// tuned for English), so Indic languages prefer it and English keeps turbo for
+// latency. Each chain falls back to the other model, so an unavailable model
+// degrades gracefully instead of silently producing poor captions.
+const GROQ_STT_CHAINS: Record<string, string[]> = {
+  kn: ["whisper-large-v3", "whisper-large-v3-turbo"],
+  hi: ["whisper-large-v3", "whisper-large-v3-turbo"],
+  en: ["whisper-large-v3-turbo", "whisper-large-v3"],
+};
+const ALL_GROQ_STT_MODELS = [...new Set([...GROQ_STT_CHAINS.kn, ...GROQ_STT_CHAINS.en])];
+const GROQ_STT_MODEL = GROQ_STT_CHAINS.en[0]; // kept for logging/compat
+
+// Default domain lexicon per language. Whisper's `prompt` biases the decoder, so
+// seeding it with the words this helpline actually hears keeps local food items,
+// hotel names and FSSAI vocabulary from being corrected into unrelated English.
+// A caller-supplied hint (from the IVR) takes precedence.
+const STT_DOMAIN_HINTS: Record<string, string> = {
+  kn: "ಆಹಾರ ಸುರಕ್ಷತೆ ದೂರು. ಇಡ್ಲಿ, ದೋಸೆ, ಬಿರಿಯಾನಿ, ಅನ್ನ, ಸಾಂಬಾರ್, ಪಲ್ಯ, ಚಪಾತಿ, ಊಟ, ಚಹಾ, ಕಾಫಿ, ಹೋಟೆಲ್, ರೆಸ್ಟೋರೆಂಟ್, ಕ್ಯಾಂಟೀನ್, ತಿಂಡಿ, ಮಜ್ಜಿಗೆ. ಹುಳು, ಕೂದಲು, ಕಲುಷಿತ, ವಾಸನೆ, ಹಳಸಿದ, ಕೊಳಕು, ಅಜೀರ್ಣ, ವಾಂತಿ, ಹೊಟ್ಟೆ ನೋವು, ಜಾಸ್ತಿ ಉಪ್ಪು. ನಿನ್ನೆ, ಇಂದು, ಸಂಜೆ, ರಾತ್ರಿ, ಬೆಳಗ್ಗೆ. ದೂರು ದಾಖಲಿಸಿ, FSSAI, ಪರವಾನಗಿ.",
+  hi: "खाद्य सुरक्षा शिकायत. इडली, डोसा, बिरयानी, चावल, सांभर, सब्जी, रोटी, चाय, कॉफी, होटल, रेस्टोरेंट, ढाबा, नाश्ता. कीड़ा, बाल, मिलावट, बदबू, बासी, गंदा, पेट दर्द, उल्टी, ज्यादा नमक. कल, आज, शाम, रात, सुबह. शिकायत दर्ज, FSSAI, लाइसेंस.",
+  // The verbs matter: without them the decoder had nothing pulling "ate" back
+  // from the digit homophone "8".
+  en: "Food safety complaint helpline. I ate, we ate, had, ordered, drank, eat, eating, food, meal, idli, dosa, biryani, rice, sambar, curry, chapati, tea, coffee, hotel, restaurant, canteen, breakfast, lunch, dinner. insect, hair, contaminated, foul smell, stale, unhygienic, stomach pain, vomiting, excess salt. yesterday, today, evening, night, morning. file complaint, FSSAI, licence, hygiene.",
+};
 
 // Helper for timeout-safe fetch
 async function fetchWithTimeout(url: string, options: any = {}, timeoutMs = 12000): Promise<Response> {
@@ -277,6 +300,39 @@ async function initDB() {
       await turso.execute(`CREATE INDEX IF NOT EXISTS idx_ivr_calls_phone ON ivr_calls (phone, startedAt)`);
     } catch (e) {}
 
+    // --- Main-page conversations. The chat used to be stateless: memory lived
+    // only in the browser's last few messages, so a reload wiped it and the
+    // assistant could not answer "what did I say?". Each conversation is now
+    // stored server-side with its full turn list.
+    // `phone` is the OWNER of the conversation. Memory is only ever served back
+    // to the same phone number, so one caller's history can never appear in
+    // another caller's session.
+    await turso.execute(`
+      CREATE TABLE IF NOT EXISTS conversations (
+        id TEXT PRIMARY KEY,
+        phone TEXT,
+        language TEXT,
+        profile TEXT,
+        facts TEXT,
+        turns TEXT,
+        closedAt INTEGER,
+        updatedAt INTEGER
+      )
+    `);
+    try {
+      await turso.execute(`CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations (updatedAt)`);
+    } catch (e) {}
+    // Columns added after the table already existed in some deployments.
+    try {
+      await turso.execute(`ALTER TABLE conversations ADD COLUMN phone TEXT`);
+    } catch (e) {}
+    try {
+      await turso.execute(`ALTER TABLE conversations ADD COLUMN closedAt INTEGER`);
+    } catch (e) {}
+    try {
+      await turso.execute(`CREATE INDEX IF NOT EXISTS idx_conversations_phone ON conversations (phone, updatedAt)`);
+    } catch (e) {}
+
     // Seed default common Q&A items if table is empty
     try {
       const existing = await turso.execute("SELECT COUNT(*) as cnt FROM qa_cache");
@@ -368,7 +424,7 @@ async function verifyGroqCredentials() {
       // Also confirm the configured model IDs actually exist on THIS key, so a
       // key from a different account/tier can never fail silently at call time.
       const catalog: string[] = (await res.json())?.data?.map((m: any) => m.id) || [];
-      const wanted = [...new Set([...GROQ_VOICE_MODELS, ...GROQ_TEXT_MODELS, GROQ_STT_MODEL])];
+      const wanted = [...new Set([...GROQ_VOICE_MODELS, ...GROQ_TEXT_MODELS, ...ALL_GROQ_STT_MODELS])];
       const missing = wanted.filter((m) => !catalog.includes(m));
       const usable = wanted.filter((m) => catalog.includes(m));
       console.log(`[Provider check] ${catalog.length} models on this key; usable here: ${usable.join(", ") || "none"}`);
@@ -840,6 +896,86 @@ app.post("/api/process-document", requireAdmin, upload.single("file"), async (re
   }
 });
 
+/**
+ * Collapses a phrase repeated N times into ONE copy.
+ *
+ * Mirrors `collapseRepetitions` in src/utils/text.ts. ROOT CAUSE of "I said 3
+ * words and it showed them 3 to 7 times": Whisper replays/loops on silence and
+ * on a long decoder prompt, and a replayed clip is re-transcribed slightly
+ * differently each time, so one utterance comes back as several near-identical
+ * copies. The transcript was returned completely raw, so those copies went
+ * straight into the caption, the chat message and the LLM prompt.
+ */
+function collapseRepetitions(text: string): string {
+  const words = String(text || '').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+  if (words.length < 2) return words.join(' ');
+
+  const norm = words.map((w) => w.toLowerCase().replace(/[^\p{L}\p{N}]/gu, ''));
+
+  // 1. Exact period: the whole sequence is the same k words repeated N times.
+  for (let period = 1; period <= Math.floor(words.length / 2); period++) {
+    if (words.length % period !== 0) continue;
+    let periodic = true;
+    for (let i = period; i < words.length; i++) {
+      if (norm[i] !== norm[i % period]) {
+        periodic = false;
+        break;
+      }
+    }
+    if (periodic) return words.slice(0, period).join(' ');
+  }
+
+  // 2. Near-exact period: a replayed clip comes back slightly different each
+  //    time, so accept a copy whose words are >= 80% positionally equal.
+  for (let copies = 8; copies >= 2; copies--) {
+    if (words.length % copies !== 0) continue;
+    const unit = words.length / copies;
+    let repeated = true;
+    for (let c = 1; c < copies && repeated; c++) {
+      let same = 0;
+      for (let i = 0; i < unit; i++) {
+        if (norm[i] === norm[i + c * unit]) same++;
+      }
+      if (same / unit < 0.8) repeated = false;
+    }
+    if (repeated) return words.slice(0, unit).join(' ');
+  }
+
+  return words.join(' ');
+}
+
+/**
+ * Repairs the recogniser's digit-homophone mistakes ("I 8 food" -> "I ate food").
+ *
+ * Mirrors `normalizeRecognizedText` in src/utils/text.ts. Speech models emit the
+ * digit for a word that sounds the same ("ate"->8, "for"->4, "to"->2) on short or
+ * unclear clips, and nothing was pulling them back, so the digit reached the
+ * caption, the chat and memory. Every rule is anchored so a real quantity is
+ * never touched ("at 8 pm", "8 idlis", "2 dosas", "₹200" are all left alone).
+ */
+function normalizeRecognizedText(text: string): string {
+  let out = String(text || '');
+  if (!out) return '';
+  // PROTECT FIRST: an 8 after a preposition or an identifier is a real time or
+  // number, never the verb "ate" (see the mirror in src/utils/text.ts).
+  out = out.replace(/\b(at|on|by|around|about|after|before|till|until|from|till)\s+8\b/gi, '$1 eight');
+  out = out.replace(/\b(room|flat|door|table|gate|bus|train|floor|shop|plot|seat|no|number|token|slip)\s+8\b/gi, '$1 eight');
+  out = out.replace(/\b(I|we|they|he|she|you|i)\s+8\b/g, '$1 ate');
+  out = out.replace(/\b8\s+(the|my|our|his|her|their|some)\b/gi, 'ate $1');
+  out = out.replace(/\b8\s+(food|meal|breakfast|lunch|dinner|snack|rice|curd|sambar|something)\b/gi, 'ate $1');
+  out = out.replace(/\b4\s+(me|you|us|them|him|this|that)\b/gi, 'for $1');
+  out = out.replace(/\b2\s+(me|you|us|them|him|her)\b/gi, 'to $1');
+  out = out.replace(/\b(want|wanted|need|needed|going|go|try|tried|like|liked|have|has|had|use|used|eat|ate)\s+2\s+([a-z])/gi, '$1 to $2');
+  return out.replace(/\s+/g, ' ').trim();
+}
+
+/** True when the text contains a repeated phrase that collapsing would remove. */
+function looksRepetitive(text: string): boolean {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  return collapseRepetitions(t) !== t;
+}
+
 // Helper to strip all emojis and symbols from text before TTS so they are never read out
 function stripEmojis(text: string): string {
   if (!text) return '';
@@ -1172,6 +1308,277 @@ function analyzeCustomerWords(
   return entities;
 }
 
+// ---------------------------------------------------------------------------
+// Conversation memory for the main-page chat
+//
+// The chat was stateless: the only "memory" was the last handful of messages the
+// browser chose to resend, so a page reload forgot everything and the assistant
+// could not answer "what did I say?" - it had never been given the transcript.
+// Conversations are now stored server-side (Turso, with an in-memory fallback)
+// and every turn is appended, so memory is complete, durable and authoritative.
+// ---------------------------------------------------------------------------
+type ConversationTurn = { role: "user" | "assistant"; text: string; at: number };
+type ConversationRecord = {
+  id: string;
+  /** Owner of this conversation. Memory is NEVER served across phone numbers. */
+  phone: string;
+  language: string;
+  profile: any;
+  turns: ConversationTurn[];
+  /** Set when the caller starts a new thread, so it is not re-adopted. */
+  closedAt?: number;
+  updatedAt: number;
+};
+
+const conversationMemory = new Map<string, ConversationRecord>();
+const MAX_STORED_TURNS = 40;
+const MAX_CONVERSATIONS_IN_MEMORY = 200;
+
+/** Phone numbers are compared on digits only, so formatting cannot split an identity. */
+function normalizePhone(value: any): string {
+  return String(value || "").replace(/\D/g, "").slice(0, 15);
+}
+
+/**
+ * Load a conversation ONLY for its owner.
+ *
+ * PRIVACY: a conversation id is a capability, but it is not a licence to read
+ * someone else's history - the same browser can be shared, and an id can leak.
+ * The stored owner must match the requester (or both be absent), otherwise the
+ * caller is treated as a stranger and gets a fresh, empty conversation.
+ */
+async function loadConversation(id: string, phone: string): Promise<ConversationRecord | null> {
+  const cleanId = String(id || "").trim().slice(0, 80);
+  if (!cleanId) return null;
+  const owner = normalizePhone(phone);
+
+  const cached = conversationMemory.get(cleanId);
+  if (cached) {
+    const cachedOwner = normalizePhone(cached.phone);
+    if (cachedOwner && owner && cachedOwner !== owner) {
+      console.warn("[Memory] Refused to serve a conversation owned by a different phone number.");
+      return null;
+    }
+    return cached;
+  }
+
+  const turso = getTurso();
+  if (!turso) return null;
+  try {
+    const result = await turso.execute({
+      sql: "SELECT * FROM conversations WHERE id = ? LIMIT 1",
+      args: [cleanId],
+    });
+    const row: any = result.rows[0];
+    if (!row) return null;
+
+    const rowOwner = normalizePhone(row.phone);
+    if (rowOwner && owner && rowOwner !== owner) {
+      console.warn("[Memory] Refused to serve a conversation owned by a different phone number.");
+      return null;
+    }
+
+    const record: ConversationRecord = {
+      id: cleanId,
+      phone: rowOwner,
+      language: String(row.language || "English"),
+      profile: row.profile ? JSON.parse(String(row.profile)) : {},
+      turns: row.turns ? JSON.parse(String(row.turns)) : [],
+      closedAt: row.closedAt ? Number(row.closedAt) : undefined,
+      updatedAt: Number(row.updatedAt || Date.now()),
+    };
+    conversationMemory.set(cleanId, record);
+    return record;
+  } catch (err: any) {
+    console.warn("Could not load conversation:", err?.message);
+    return null;
+  }
+}
+
+/**
+ * True when this conversation id already belongs to a DIFFERENT caller.
+ *
+ * Used to decide whether an unrecognised id may be reused for a new thread. A free
+ * id is safe to reuse (that is how the client's New conversation button names its
+ * thread), but an id owned by someone else must never be taken over - doing so
+ * would hand one caller's history to another. A caller with no phone number is
+ * treated as "different" from any registered owner, so an anonymous session can
+ * never claim a thread that belongs to someone.
+ */
+async function isConversationOwnedByOther(id: string, phone: string): Promise<boolean> {
+  const cleanId = String(id || "").trim().slice(0, 80);
+  if (!cleanId) return false;
+  const owner = normalizePhone(phone);
+
+  const cached = conversationMemory.get(cleanId);
+  if (cached) {
+    const cachedOwner = normalizePhone(cached.phone);
+    return !!cachedOwner && cachedOwner !== owner;
+  }
+
+  const turso = getTurso();
+  if (!turso) return false;
+  try {
+    const result = await turso.execute({
+      sql: "SELECT phone FROM conversations WHERE id = ? LIMIT 1",
+      args: [cleanId],
+    });
+    const row: any = result.rows[0];
+    if (!row) return false;
+    const rowOwner = normalizePhone(row.phone);
+    return !!rowOwner && rowOwner !== owner;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The caller's own most recent OPEN conversation, so memory follows them to a new
+ * device. Strictly scoped to one phone number, so it can never surface another
+ * caller's history.
+ */
+async function findLatestConversationForPhone(phone: string): Promise<ConversationRecord | null> {
+  const owner = normalizePhone(phone);
+  if (owner.length < 10) return null;
+
+  const localBest = [...conversationMemory.values()]
+    .filter((c) => normalizePhone(c.phone) === owner && !c.closedAt)
+    .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  if (localBest) return localBest;
+
+  const turso = getTurso();
+  if (!turso) return null;
+  try {
+    const result = await turso.execute({
+      sql: `SELECT * FROM conversations
+            WHERE phone = ? AND (closedAt IS NULL OR closedAt = 0)
+            ORDER BY updatedAt DESC LIMIT 1`,
+      args: [owner],
+    });
+    const row: any = result.rows[0];
+    if (!row) return null;
+    const record: ConversationRecord = {
+      id: String(row.id),
+      phone: owner,
+      language: String(row.language || "English"),
+      profile: row.profile ? JSON.parse(String(row.profile)) : {},
+      turns: row.turns ? JSON.parse(String(row.turns)) : [],
+      updatedAt: Number(row.updatedAt || Date.now()),
+    };
+    conversationMemory.set(record.id, record);
+    return record;
+  } catch (err: any) {
+    console.warn("Could not look up the caller's conversations:", err?.message);
+    return null;
+  }
+}
+
+/** Mark a conversation closed so it is not silently re-adopted as "latest". */
+async function closeConversation(id: string, phone: string): Promise<boolean> {
+  const record = await loadConversation(id, phone);
+  if (!record) return false;
+  record.closedAt = Date.now();
+  await saveConversation(record);
+  return true;
+}
+
+async function saveConversation(record: ConversationRecord): Promise<void> {
+  record.turns = record.turns.slice(-MAX_STORED_TURNS);
+  record.updatedAt = Date.now();
+  conversationMemory.set(record.id, record);
+
+  // Keep the in-memory cache bounded: drop the least recently used conversations.
+  if (conversationMemory.size > MAX_CONVERSATIONS_IN_MEMORY) {
+    const oldest = [...conversationMemory.values()].sort((a, b) => a.updatedAt - b.updatedAt);
+    for (const stale of oldest.slice(0, conversationMemory.size - MAX_CONVERSATIONS_IN_MEMORY)) {
+      conversationMemory.delete(stale.id);
+    }
+  }
+
+  const turso = getTurso();
+  if (!turso) return;
+  try {
+    await turso.execute({
+      sql: `INSERT INTO conversations (id, phone, language, profile, facts, turns, closedAt, updatedAt)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              phone = excluded.phone,
+              language = excluded.language,
+              profile = excluded.profile,
+              facts = excluded.facts,
+              turns = excluded.turns,
+              closedAt = excluded.closedAt,
+              updatedAt = excluded.updatedAt`,
+      args: [
+        record.id,
+        normalizePhone(record.phone),
+        record.language,
+        JSON.stringify(record.profile || {}),
+        "",
+        JSON.stringify(record.turns),
+        record.closedAt || 0,
+        record.updatedAt,
+      ],
+    });
+  } catch (err: any) {
+    console.warn("Could not persist conversation:", err?.message);
+  }
+}
+
+// "What did I say?" must never be answered with "I don't know". When the caller
+// asks to be reminded, the stored turns are replayed verbatim - no model guess.
+const RECALL_PATTERNS = [
+  /\bwhat did i (?:say|tell|mention|report|complain|ask)\b/i,
+  /\bwhat (?:was|were) my (?:words|complaint|problem)\b/i,
+  /\b(?:repeat|tell me) (?:what|that) i (?:said|told)\b/i,
+  /\bdo you remember what i\b/i,
+  /ನಾನು\s*ಏನು\s*ಹೇಳಿದೆ/,
+  /ನಾನು\s*ಹೇಳಿದ್ದು/,
+  /ನನ್ನ\s*ಮಾತು/,
+  /ನೆನಪಿದೆಯಾ/i,
+  /(?:मैंने|मैने)\s*क्या\s*(?:कहा|बताया)/,
+  /मुझे\s*याद/i,
+];
+
+function wantsRecall(text: string): boolean {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  return RECALL_PATTERNS.some((re) => re.test(t));
+}
+
+function buildRecallReply(record: ConversationRecord | null, langName: string, currentText: string): string {
+  const previous = (record?.turns || [])
+    .filter((t) => t.role === "user")
+    .map((t) => t.text.trim())
+    .filter((t) => t && t.toLowerCase() !== currentText.trim().toLowerCase());
+
+  if (!previous.length) {
+    if (langName === "Kannada") return "ಈ ಸಂಭಾಷಣೆಯಲ್ಲಿ ನೀವು ಇನ್ನೂ ಏನನ್ನೂ ಹೇಳಿಲ್ಲ. ದಯವಿಟ್ಟು ತಮ್ಮ ಸಮಸ್ಯೆಯನ್ನು ತಿಳಿಸಿ.";
+    if (langName === "Hindi") return "इस बातचीत में आपने अभी तक कुछ नहीं कहा। कृपया अपनी समस्या बताएं।";
+    return "You haven't told me anything yet in this conversation. Please describe your issue.";
+  }
+
+  const listed = previous.slice(-6).map((t) => `• ${t}`).join("\n");
+
+  if (langName === "Kannada") return `ನೀವು ಈವರೆಗೆ ಹೇಳಿದ್ದು:\n${listed}\n\nಇದರಲ್ಲಿ ಏನಾದರೂ ಸೇರಿಸಲು ಬಯಸುವಿರಾ?`;
+  if (langName === "Hindi") return `आपने अब तक यह बताया है:\n${listed}\n\nइसमें कुछ जोड़ना चाहेंगे?`;
+  return `Here is what you've told me so far:\n${listed}\n\nWould you like to add anything to that?`;
+}
+
+// Start a fresh conversation: close the caller's previous thread so it is no
+// longer picked up as their "latest" open conversation.
+app.post("/api/chat/new", chatLimit, async (req, res) => {
+  try {
+    const phone = normalizePhone(req.body?.profile?.phone);
+    const previousId = String(req.body?.conversationId || "").trim().slice(0, 80);
+    if (previousId) await closeConversation(previousId, phone);
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.warn("[Chat] Could not close the previous conversation:", error?.message);
+    res.status(500).json({ error: "Could not start a new conversation" });
+  }
+});
+
 // API: Chat with Assistant (100% Dynamic AI Generation - No Hardcoded or Cached Answers)
 app.post("/api/chat", chatLimit, async (req, res) => {
   const { message, context, language, profile, history } = req.body;
@@ -1179,27 +1586,105 @@ app.post("/api/chat", chatLimit, async (req, res) => {
     return res.status(400).json({ error: "Message is required" });
   }
 
-  const queryText = message.trim();
+  // Collapse a repeated utterance before it reaches memory or the model, so the
+  // assistant never mirrors back "idli idli idli".
+  const queryText = collapseRepetitions(String(message || '')).trim();
   const targetLang = language || "English";
   const isKannada = targetLang.toLowerCase().includes("kan") || targetLang.toLowerCase().includes("kn");
   const isHindi = targetLang.toLowerCase().includes("hin") || targetLang.toLowerCase().includes("hi");
   const langName = isKannada ? "Kannada" : (isHindi ? "Hindi" : "English");
 
-  // Semantic Memory & Customer Words Analysis across turns
-  const analysis = analyzeCustomerWords(queryText, history, {}, langName);
+  // --- Server-side conversation memory -------------------------------------
+  // The transcript lives on the server now, so memory no longer depends on how
+  // many messages the browser happens to resend, and it survives a reload.
+  const requestedConversationId = String(req.body?.conversationId || "").trim().slice(0, 80);
+  const callerPhone = normalizePhone(profile?.phone);
 
-  // ROOT-CAUSE FIX ("it doesn't remember what I said before"): the prompt used to
-  // hand the model only a thin, implicit history, so every turn behaved like the
-  // first one and the assistant asked again for details the caller had already
-  // given. The previously-stated facts and the caller's own earlier words are now
-  // spelled out explicitly in the prompt.
-  const priorUserTurns = (Array.isArray(history) ? history : [])
-    .filter((h: any) => String(h?.role || h?.sender || 'user') !== 'assistant')
-    .map((h: any) => String(h?.content || h?.text || '').trim())
-    .filter(Boolean)
-    // Drop the current message if the client already included it in history.
-    .filter((t: string) => t.toLowerCase() !== queryText.toLowerCase())
-    .slice(-8);
+  // PRIVACY: loadConversation only returns a thread whose stored owner matches
+  // the caller. If the browser presents an id that belongs to someone else
+  // (shared device, leaked id), it resolves to null and that caller never sees
+  // the other person's history.
+  let conversation: ConversationRecord | null = requestedConversationId
+    ? await loadConversation(requestedConversationId, callerPhone)
+    : null;
+
+  // Adopt a previous thread ONLY when the caller supplied no id at all - that is
+  // the "new device, nothing stored here yet" case.
+  //
+  // An id that we do not recognise means the client deliberately generated a
+  // fresh one (the New conversation button). Adopting an older thread there would
+  // silently resurrect the topic the caller just cleared, so it must NOT happen.
+  if (!conversation && !requestedConversationId && callerPhone.length >= 10) {
+    conversation = await findLatestConversationForPhone(callerPhone);
+  }
+
+  if (!conversation) {
+    // Reuse the id the client chose (that is how its New conversation button
+    // names a fresh thread) - but only if it is genuinely free. An id owned by a
+    // different caller is never taken over.
+    const idTakenByOther = requestedConversationId
+      ? await isConversationOwnedByOther(requestedConversationId, callerPhone)
+      : false;
+
+    conversation = {
+      id: requestedConversationId && !idTakenByOther
+        ? requestedConversationId
+        : `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      phone: callerPhone,
+      language: langName,
+      profile: profile || {},
+      turns: [],
+      updatedAt: Date.now(),
+    };
+  }
+
+  // Bind the owner on first use, and record it for the response below.
+  if (callerPhone) conversation.phone = callerPhone;
+  const conversationId = conversation.id;
+
+  // Everything the caller has said before this message (used for recall + facts).
+  const earlierUserTurns = conversation.turns
+    .filter((t) => t.role === "user")
+    .map((t) => t.text.trim())
+    .filter(Boolean);
+
+  // Record the new user turn immediately, so recall sees it and a crash later
+  // cannot lose it.
+  conversation.turns.push({ role: "user", text: queryText, at: Date.now() });
+  conversation.language = langName;
+  if (profile) conversation.profile = profile;
+
+  // Answer "what did I say?" from the stored transcript instead of letting the
+  // model guess - a small model reliably replied "I don't know" here.
+  if (wantsRecall(queryText)) {
+    const replyText = buildRecallReply(conversation, langName, queryText);
+    conversation.turns.push({ role: "assistant", text: replyText, at: Date.now() });
+    await saveConversation(conversation);
+    let audioUrl: string | null = null;
+    try {
+      audioUrl = await generateTTSAudioUrl(replyText, langName);
+    } catch {
+      audioUrl = null;
+    }
+    return res.json({
+      response: replyText,
+      spokenText: replyText,
+      markdownReport: "",
+      audioUrl,
+      isComplaintDraft: false,
+      conversationId,
+      recalled: true,
+      cached: false,
+    });
+  }
+
+  // Facts are derived from the WHOLE stored conversation, not just the messages
+  // the browser resent - this is what stops "I said idli" being followed by
+  // "what did you eat?".
+  const historyTurns = conversation.turns.map((t) => ({ role: t.role, text: t.text }));
+  const analysis = analyzeCustomerWords(queryText, [...historyTurns, ...(Array.isArray(history) ? history : [])], {}, langName);
+
+  const priorUserTurns = earlierUserTurns.slice(-10);
 
   const knownFacts = [
     analysis.location ? `Incident location / establishment: ${analysis.location}` : '',
@@ -1210,10 +1695,28 @@ app.post("/api/chat", chatLimit, async (req, res) => {
     profile?.location ? `Caller city: ${profile.location}` : '',
   ].filter(Boolean).join('\n');
 
+  const alreadyAsked = conversation.turns.filter((t) => t.role === "assistant").map((t) => t.text).slice(-4);
+
+  // Cross-surface memory: this caller's earlier phone calls and complaints, so the
+  // website assistant knows what they already reported. Scoped to their phone
+  // number only - it can never return another caller's history.
+  let crossSurfaceMemory = "";
+  if (callerPhone.length >= 10) {
+    try {
+      crossSurfaceMemory = await loadCallerMemory(callerPhone);
+    } catch (e: any) {
+      console.warn("[Memory] cross-surface lookup notice:", e?.message);
+    }
+  }
+
   const memoryBlock = [
-    knownFacts ? `Details the caller has ALREADY given:\n${knownFacts}` : 'Details the caller has already given: none yet.',
+    knownFacts ? `FACTS ALREADY ESTABLISHED (treat as known, never ask again):\n${knownFacts}` : 'FACTS ALREADY ESTABLISHED: none yet.',
     priorUserTurns.length
       ? `The caller's own earlier words this conversation, oldest first:\n- ${priorUserTurns.join('\n- ')}`
+      : '',
+    alreadyAsked.length ? `Your own recent replies (do NOT repeat these questions):\n- ${alreadyAsked.join('\n- ')}` : '',
+    crossSurfaceMemory
+      ? `This caller's earlier contact with us on the phone helpline (use it naturally, do not read it out as a list):\n${crossSurfaceMemory}`
       : '',
   ].filter(Boolean).join('\n\n');
 
@@ -1263,11 +1766,12 @@ CORE BEHAVIOR INSTRUCTIONS:
    - Answer directly, accurately, and conversationally in 1-2 concise sentences without repeating greetings.
 
 4. GRIEVANCE / COMPLAINT REPORTING (Only when user reports a food safety issue):
-   - If details are missing (WHERE / WHEN / CAUSE), politely ask ONLY for the missing detail.
-   - NEVER ask again for a detail that appears in the conversation memory below, or that the caller already stated in this conversation. If the location, hotel name, food item, date/time or the cause is already known, treat it as known and move the conversation forward.
+   - Details already established from this conversation - Location: "${analysis.location || "unknown"}", When: "${analysis.when || "unknown"}", Cause: "${analysis.cause || "unknown"}", What they ate: "${analysis.item || "unknown"}".
+   - NEVER ask for anything marked as known above. In particular, if a food item has already been mentioned (for example idli, dosa or biryani), do NOT ask "what did you eat?" - it is already answered.
+   - If details are genuinely missing (WHERE / WHEN / CAUSE / ITEM), politely ask ONLY for the missing detail.
    - Ask for at most ONE genuinely missing detail per turn.
    - If the caller refers back to something ("that place", "the same problem", "what I told you"), resolve it from the conversation and answer directly instead of asking again.
-   - If all details are known (Location: "${analysis.location || ""}", When: "${analysis.when || ""}", Cause: "${analysis.cause || ""}") OR user confirms submission:
+   - If all details are known OR user confirms submission:
      Format the official grievance report in clean Markdown starting with:
      # 📋 Official Food Safety & Inspection Grievance Report
      and ending with COMPLAINT_DRAFT_REQUEST.
@@ -1277,15 +1781,22 @@ ${memoryBlock}
 
 Always respond warmly, naturally, and directly to what the user actually said.`;
 
-    const conversationHistory = Array.isArray(history) && history.length > 0
-      ? history.slice(-12).map((h: any) => ({
-          role: (h.role === "assistant" || h.sender === "assistant") ? "assistant" : "user",
-          content: String(h.content || h.text || "")
-        }))
-      : [];
+    // History comes from the stored conversation (the browser's copy is only a
+    // fallback), so the model always sees the real, complete dialogue.
+    const storedPriorTurns = conversation.turns
+      .slice(0, -1) // drop the user turn just appended; it is sent as the prompt below
+      .slice(-16)
+      .map((t) => ({ role: t.role, content: t.text }));
 
-    const fullMessages = [
-      ...conversationHistory,
+    const fallbackHistory = storedPriorTurns.length
+      ? []
+      : (Array.isArray(history) ? history : []).slice(-12).map((h: any) => ({
+          role: (h.role === "assistant" || h.sender === "assistant") ? ("assistant" as const) : ("user" as const),
+          content: String(h.content || h.text || ""),
+        }));
+
+    const fullMessages: Array<{ role: string; content: string }> = [
+      ...(storedPriorTurns.length ? storedPriorTurns : fallbackHistory),
       { role: "user", content: queryText }
     ];
 
@@ -1351,12 +1862,18 @@ Always respond warmly, naturally, and directly to what the user actually said.`;
     // Generate audio for fast playback & storage using spoken portion
     const audioUrl = await generateTTSAudioUrl(spokenPart.slice(0, 450), langName);
 
+    // Persist the assistant turn, so the next call sees the full exchange and
+    // "what did I say?" can be answered from real records.
+    conversation.turns.push({ role: "assistant", text: cleanedText, at: Date.now() });
+    await saveConversation(conversation);
+
     res.json({ 
       response: cleanedText, 
       spokenText: spokenPart,
       markdownReport: markdownPart,
       audioUrl, 
       isComplaintDraft, 
+      conversationId,
       cached: false 
     });
   } catch (error: any) {
@@ -1662,6 +2179,53 @@ async function loadCallerMemory(phone?: string): Promise<string> {
   }
 }
 
+/**
+ * The reverse direction: what this caller already said in the WEBSITE chat, so a
+ * phone call does not make them repeat it. Strictly scoped to one phone number.
+ * Only compact derived facts are used, never the raw transcript.
+ */
+async function loadWebChatCallerMemory(phone: string, langName = "English"): Promise<string> {
+  const owner = normalizePhone(phone);
+  if (owner.length < 10) return "";
+  const turso = getTurso();
+  if (!turso) return "";
+  try {
+    const result = await turso.execute({
+      sql: "SELECT turns, updatedAt FROM conversations WHERE phone = ? ORDER BY updatedAt DESC LIMIT 2",
+      args: [owner],
+    });
+
+    const lines: string[] = [];
+    for (const r of result.rows as any[]) {
+      let turns: any[] = [];
+      try {
+        turns = JSON.parse(String(r.turns || "[]"));
+      } catch {}
+      const userText = turns
+        .filter((t) => t && t.role === "user")
+        .map((t) => String(t.text || "").trim())
+        .filter(Boolean);
+      if (!userText.length) continue;
+
+      const priorTurns = userText.slice(0, -1).map((t) => ({ role: "user", text: t }));
+      const analysis = analyzeCustomerWords(userText[userText.length - 1], priorTurns, {}, langName);
+      const when = r.updatedAt ? new Date(Number(r.updatedAt)).toLocaleDateString() : "recently";
+      const bits = [
+        analysis.cause ? `issue: ${analysis.cause}` : "",
+        analysis.item ? `food: ${analysis.item}` : "",
+        analysis.location ? `place: ${analysis.location}` : "",
+        analysis.when ? `when: ${analysis.when}` : "",
+      ].filter(Boolean).join(", ");
+
+      lines.push(`- Website chat on ${when}: ${bits || userText[userText.length - 1].slice(0, 140)}`);
+    }
+    return lines.join("\n");
+  } catch (e: any) {
+    console.warn("[Memory] web-chat caller memory notice:", e?.message);
+    return "";
+  }
+}
+
 const IVR_GREETING_WORDS = [
   "namaskara", "namaskaram", "namaskar", "namaste", "namasthe", "hello", "hi there", "hi", "hey",
   "नमस्कार", "नमस्ते", "हैलो", "ನಮಸ್ಕಾರ", "ನಮಸ್ತೆ", "ಹಲೋ", "ಸ್ವಾಗತ", "ಸುಸ್ವಾಗತ",
@@ -1795,7 +2359,7 @@ function isIvrConfirmation(text: string): boolean {
 // API: Dedicated Calm & Pleasant IVR Dialogue State Machine
 app.post("/api/ivr/dialogue", voiceLimit, async (req, res) => {
   const { 
-    message, 
+    message: rawMessage, 
     digits, 
     step = "welcome", 
     language = "en-IN", 
@@ -1807,6 +2371,12 @@ app.post("/api/ivr/dialogue", voiceLimit, async (req, res) => {
     callId,
     turnIndex = 0
   } = req.body;
+
+  // Collapse a repeated utterance here too. The IVR used to run its "did they
+  // already give me the location?" checks against text that could contain the
+  // same words several times, and a repeated "yes yes yes" could trip the
+  // confirmation branch more than once.
+  const message = collapseRepetitions(String(rawMessage || '')).trim();
 
   const callerTurn = Number(turnIndex) || 0;
   let currentLang = collectedData?.language || language || "en-IN";
@@ -2048,6 +2618,9 @@ ${updatedData.audioNoteUrl ? `**Voice Note Attached (MP3):** [Play Voice Evidenc
       //     this caller's earlier calls.
       const knowledge = await getIvrKnowledgeContext(currentLang, saidText);
       const callerMemory = await loadCallerMemory(profile?.phone);
+      // What they already described on the website, so the call does not make
+      // them start over. Same phone number only.
+      const webChatMemory = await loadWebChatCallerMemory(profile?.phone, langName);
 
       const memoryBlock = `Known so far in this call:
 - Cause / problem: ${updatedData.cause || "not yet known"}
@@ -2056,7 +2629,7 @@ ${updatedData.audioNoteUrl ? `**Voice Note Attached (MP3):** [Play Voice Evidenc
 - Food item: ${updatedData.item || "not yet known"}
 - Still missing: ${analysis.missingFields.join(", ") || "nothing"}
 - Caller says they are done / confirming: ${analysis.isExhaustedOrConfirming ? "yes" : "no"}
-${callerMemory ? `Earlier contact with this caller:\n${callerMemory}` : ""}`;
+${callerMemory ? `Earlier contact with this caller:\n${callerMemory}` : ""}${webChatMemory ? `\nWhat this caller already told us on the website chat:\n${webChatMemory}` : ""}`;
 
       const languageRules = `LANGUAGE: reply ONLY in ${langName}. ${
         isKannada
@@ -2382,7 +2955,7 @@ app.post("/api/stt", voiceLimit, upload.single("audio"), async (req: any, res) =
     }
 
     const rawLang = String(req.body?.language || "en-IN");
-    const hint = String(req.body?.hint || "").slice(0, 400);
+    const hint = String(req.body?.hint || "").trim().slice(0, 800);
     const langCode = normalizeIvrLang(rawLang); // kn-IN | hi-IN | en-IN
     const whisperCode = langCode === "kn-IN" ? "kn" : langCode === "hi-IN" ? "hi" : "en";
 
@@ -2394,50 +2967,81 @@ app.post("/api/stt", voiceLimit, upload.single("audio"), async (req: any, res) =
         ? new File([buffer], name, { type })
         : new Blob([buffer], { type });
 
-    // Groq Whisper large-v3-turbo. It genuinely understands Kannada, Hindi and
-    // English, and the language is FORCED here - so the transcript can never
-    // silently drift to English the way the browser engine did.
+    // Walk the language's STT chain. The language is FORCED and the decoder is
+    // seeded with a domain lexicon, so the transcript cannot silently drift to
+    // English and local food/hotel words are not "corrected" into nonsense.
     const groqKey = getGroqKey();
     if (groqKey) {
-      try {
-        const formData = new FormData();
-        formData.append("file", makeFile(audioBuffer, mime, "voice.webm") as any, "voice.webm");
-        formData.append("model", GROQ_STT_MODEL);
-        formData.append("language", whisperCode);
-        formData.append("temperature", "0");
-        formData.append("response_format", "json");
-        // Hint biases the decoder towards IVR vocabulary such as "ನಮಸ್ಕಾರ"
-        // (namaskara) and local outlet names, instead of guessing plain English.
-        if (hint) formData.append("prompt", hint);
+      const chain = GROQ_STT_CHAINS[whisperCode] || GROQ_STT_CHAINS.en;
+      const prompt = hint || STT_DOMAIN_HINTS[whisperCode] || "";
 
-        const groqRes = await fetchWithTimeout("https://api.groq.com/openai/v1/audio/transcriptions", {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${groqKey}`,
-          },
-          body: formData,
-        }, 12000);
+      for (const model of chain) {
+        const attempt = async (usePrompt: boolean): Promise<string> => {
+          const formData = new FormData();
+          formData.append("file", makeFile(audioBuffer, mime, "voice.webm") as any, "voice.webm");
+          formData.append("model", model);
+          formData.append("language", whisperCode);
+          formData.append("temperature", "0");
+          formData.append("response_format", "json");
+          // A long decoder prompt conditioned on silence is the classic trigger
+          // for Whisper repetition loops, so the prompt is optional here and the
+          // caller retries without it when the first result loops.
+          if (usePrompt && prompt) formData.append("prompt", prompt.slice(0, 800));
 
-        const contentType = groqRes.headers.get("content-type") || "";
-        if (contentType.includes("application/json")) {
+          const groqRes = await fetchWithTimeout("https://api.groq.com/openai/v1/audio/transcriptions", {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${groqKey}`,
+            },
+            body: formData,
+          }, 15000);
+
+          const contentType = groqRes.headers.get("content-type") || "";
+          if (!contentType.includes("application/json")) {
+            const errTxt = await groqRes.text().catch(() => "");
+            console.warn(`[STT] ${model}${usePrompt ? "" : " (no prompt)"} returned HTTP ${groqRes.status}: ${errTxt.slice(0, 200)}`);
+            return "";
+          }
           const groqData: any = await groqRes.json();
-          const text = String(groqData?.text || "").trim();
-          if (text && !isHallucinatedTranscript(text)) {
-            console.log(`[STT] groq-whisper (${whisperCode}) in ${Date.now() - startedAt}ms: "${text}"`);
+          return String(groqData?.text || "").trim();
+        };
+
+        try {
+          let text = await attempt(true);
+
+          // If the model looped, re-decode WITHOUT the prompt and keep whichever
+          // result is not repetitive.
+          if (text && looksRepetitive(text)) {
+            console.warn(`[STT] ${model} returned a repeated phrase; retrying without the decoder prompt.`);
+            const retry = await attempt(false);
+            if (retry && !looksRepetitive(retry)) text = retry;
+          }
+
+          // Collapse repeats, then repair digit homophones, so "8 food" never
+          // reaches the caption, the chat or memory.
+          const collapsed = normalizeRecognizedText(collapseRepetitions(text));
+
+          if (collapsed && !isHallucinatedTranscript(collapsed)) {
+            if (collapsed !== text) {
+              console.log(`[STT] collapsed a repeated transcript: "${text}" -> "${collapsed}"`);
+            }
+            console.log(`[STT] ${model} (${whisperCode}) in ${Date.now() - startedAt}ms: "${collapsed}"`);
             return res.json({
-              transcript: text,
-              provider: "groq-whisper",
+              transcript: collapsed,
+              repeatedRawText: collapsed !== text ? text : undefined,
+              provider: `groq-whisper:${model}`,
+              model,
               language: langCode,
               ms: Date.now() - startedAt,
             });
           }
+        } catch (modelErr: any) {
+          console.warn(`[STT] ${model} failed: ${modelErr?.message}`);
         }
-      } catch (groqWhisperErr: any) {
-        console.warn("Groq Whisper STT failed:", groqWhisperErr?.message);
       }
     }
 
-    console.warn(`[STT] Groq returned no usable transcript after ${Date.now() - startedAt}ms - the browser falls back to on-device recognition.`);
+    console.warn(`[STT] Chain [${(GROQ_STT_CHAINS[whisperCode] || []).join(" -> ")}] produced no usable transcript after ${Date.now() - startedAt}ms - the caller falls back to on-device recognition.`);
     res.status(200).json({ transcript: "", language: langCode, error: "Could not transcribe audio." });
   } catch (err: any) {
     console.error("STT endpoint error:", err);

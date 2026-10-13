@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
-import { Mic, MicOff, Send, AlertCircle, Loader2, Languages, Utensils, Upload, X, Volume2, VolumeX, Sparkles, ChevronDown, ChevronUp, Cpu, PhoneCall } from 'lucide-react';
+import { Mic, MicOff, Send, AlertCircle, Loader2, Languages, Utensils, Upload, X, Volume2, VolumeX, Sparkles, ChevronDown, ChevronUp, Cpu, PhoneCall, Plus } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { VoiceInteraction, UserProfile } from '../types';
 import ParticleBall from './ParticleBall';
 import { RenderedMarkdown } from './RenderedMarkdown';
 import { transcribeAudioInBrowser } from '../lib/clientWhisper';
-import { stripEmojis, cleanSpeechTranscript, mergeTranscripts, isAffirmation } from '../utils/text';
+import { stripEmojis, cleanSpeechTranscript, mergeTranscripts, isAffirmation, collapseRepetitions, normalizeRecognizedText } from '../utils/text';
 
 function isHallucinatedText(text: string): boolean {
   if (!text || !text.trim()) return true;
@@ -40,6 +40,14 @@ function isHallucinatedText(text: string): boolean {
   return hallucinations.includes(clean);
 }
 
+// Whisper decoder hints for the main page, matching the IVR vocabulary so the
+// same words are recognised consistently on both surfaces.
+const MAIN_PAGE_STT_HINTS: Record<string, string> = {
+  Kannada: 'ಆಹಾರ ಸುರಕ್ಷತೆ ದೂರು. ಇಡ್ಲಿ, ದೋಸೆ, ಬಿರಿಯಾನಿ, ಅನ್ನ, ಸಾಂಬಾರ್, ಪಲ್ಯ, ಚಪಾತಿ, ಊಟ, ಚಹಾ, ಕಾಫಿ, ಹೋಟೆಲ್, ರೆಸ್ಟೋರೆಂಟ್, ತಿಂಡಿ. ಹುಳು, ಕೂದಲು, ಕಲುಷಿತ, ವಾಸನೆ, ಹಳಸಿದ, ಕೊಳಕು, ಹೊಟ್ಟೆ ನೋವು, ವಾಂತಿ, ಜಾಸ್ತಿ ಉಪ್ಪು. ನಿನ್ನೆ, ಇಂದು, ಸಂಜೆ, ರಾತ್ರಿ, ಬೆಳಗ್ಗೆ. ದೂರು ದಾಖಲಿಸಿ, FSSAI.',
+  Hindi: 'खाद्य सुरक्षा शिकायत. इडली, डोसा, बिरयानी, चावल, सांभर, सब्जी, रोटी, चाय, कॉफी, होटल, रेस्टोरेंट, ढाबा. कीड़ा, बाल, मिलावट, बदबू, बासी, गंदा, पेट दर्द, उल्टी, ज्यादा नमक. कल, आज, शाम, रात, सुबह. शिकायत दर्ज, FSSAI.',
+  English: 'Food safety complaint helpline. Idli, dosa, biryani, rice, sambar, curry, chapati, tea, coffee, hotel, restaurant, canteen. insect, hair, contaminated, foul smell, stale, unhygienic, stomach pain, vomiting, excess salt. yesterday, today, evening, night, morning. file complaint, FSSAI.',
+};
+
 export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -60,7 +68,7 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
   const voicesRef = useRef<SpeechSynthesisVoice[]>([]);
   const activeUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
+
   const transcriptRef = useRef<string>('');
   const accumulatedFinalRef = useRef<string>('');
   const sessionPrefixRef = useRef<string>('');
@@ -71,6 +79,12 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
   // True while the caller is driving the orb by voice, so listening is re-armed
   // automatically as soon as the assistant finishes speaking.
   const autoListenRef = useRef<boolean>(false);
+  // Guards against dispatching the same utterance twice (energy detector and the
+  // recogniser's own silence timer can both fire).
+  const turnDispatchedRef = useRef<boolean>(false);
+  // The current utterance's recorded chunks. Owned per recorder instance so a
+  // late flush from a previous recorder cannot bleed into this turn.
+  const chunkBufferRef = useRef<Blob[]>([]);
   const vizStreamRef = useRef<MediaStream | null>(null);
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
   const silenceTimerRef = useRef<any>(null);
@@ -81,6 +95,10 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
   const vadIntervalRef = useRef<any>(null);
   const hasSpokenRef = useRef<boolean>(false);
   const lastSoundTimeRef = useRef<number>(0);
+  // The server keys conversation memory on this id, so the assistant remembers
+  // what was said even after a reload or a long conversation.
+  const conversationIdRef = useRef<string>('');
+
   // High-performance response cache for repeated queries
   const queryCacheRef = useRef<Map<string, { response: string; spokenText: string; audioUrl?: string; isComplaintDraft?: boolean; markdownReport?: string }>>(new Map());
 
@@ -97,7 +115,14 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     if (!val) setPlayingMsgId(null);
   };
 
+  // Bumped whenever playback is interrupted, so an in-flight TTS fetch from a
+  // cancelled turn can never start playing late.
+  const speakGenerationRef = useRef<number>(0);
+  // Neural audio keyed by language+text, so replays and repeated prompts are instant.
+  const neuralAudioCacheRef = useRef<Map<string, string>>(new Map());
+
   const stopSpeaking = () => {
+    speakGenerationRef.current += 1;
     if (activeAudioRef.current) {
       try {
         activeAudioRef.current.pause();
@@ -139,93 +164,156 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isLoading, transcript]);
 
+  // Restore this device's conversation id, but do NOT invent one on first run.
+  // Sending no id is what lets the server continue the caller's own thread on a
+  // new device; sending an unknown id would look like a deliberate fresh start.
+  useEffect(() => {
+    try {
+      conversationIdRef.current = localStorage.getItem('vox_conversation_id') || '';
+    } catch {
+      conversationIdRef.current = '';
+    }
+  }, []);
+
   // Release the orb visualiser microphone when the page goes away.
   useEffect(() => {
     return () => {
       autoListenRef.current = false;
-      try {
-        vizStreamRef.current?.getTracks().forEach((t) => t.stop());
-      } catch {}
-      vizStreamRef.current = null;
-    };
-  }, []);
-
-  const startRecording = async () => {
-    try {
-      if (micStream) {
-        micStream.getTracks().forEach(track => track.stop());
-      }
       if (vadIntervalRef.current) {
         clearInterval(vadIntervalRef.current);
         vadIntervalRef.current = null;
       }
-      if (audioContextRef.current) {
-        try { audioContextRef.current.close(); } catch {}
-        audioContextRef.current = null;
-      }
-
-      hasSpokenRef.current = false;
-      lastSoundTimeRef.current = 0;
-
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      setMicStream(stream);
-      
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
-        ? 'audio/webm;codecs=opus' 
-        : MediaRecorder.isTypeSupported('audio/webm') 
-          ? 'audio/webm' 
-          : 'audio/mp4';
-      
-      const recorder = new MediaRecorder(stream, { mimeType });
-      mediaRecorderRef.current = recorder;
-      audioChunksRef.current = [];
-      
-      recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          audioChunksRef.current.push(e.data);
-        }
-      };
-      
-      recorder.start(100); // 100ms timeslice for responsive audio capture
-
-      // AudioContext Voice Activity Detection (VAD) for particle energy & audio tracking
       try {
-        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-        if (AudioCtx) {
-          const audioCtx = new AudioCtx();
-          audioContextRef.current = audioCtx;
-          const source = audioCtx.createMediaStreamSource(stream);
-          const analyser = audioCtx.createAnalyser();
-          analyser.fftSize = 512;
-          analyser.smoothingTimeConstant = 0.4;
-          source.connect(analyser);
-
-          const dataArray = new Uint8Array(analyser.frequencyBinCount);
-          
-          vadIntervalRef.current = setInterval(() => {
-            if (!isListeningRef.current) return;
-            analyser.getByteFrequencyData(dataArray);
-            let sum = 0;
-            for (let i = 0; i < dataArray.length; i++) {
-              sum += dataArray[i];
-            }
-            const average = sum / dataArray.length;
-
-            // Only track sound activity when speech text has actually started capturing
-            if (average > 8 && transcriptRef.current.trim().length > 0) {
-              hasSpokenRef.current = true;
-              lastSoundTimeRef.current = Date.now();
-            }
-          }, 100);
+        vizStreamRef.current?.getTracks().forEach((t) => t.stop());
+      } catch {}
+      vizStreamRef.current = null;
+      try {
+        mediaRecorderRef.current?.state !== 'inactive' && mediaRecorderRef.current?.stop();
+      } catch {}
+      try {
+        if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+          void audioContextRef.current.close();
         }
-      } catch (vadErr) {
-        console.warn("VAD audio analyser notice:", vadErr);
-      }
+      } catch {}
+      audioContextRef.current = null;
+    };
+  }, []);
 
-      setMicError(null);
-    } catch (e: any) { 
-      console.warn("Microphone access error:", e);
-      setMicError("Microphone access is unavailable or blocked. Please check browser permissions or type your question below.");
+  // How long a silence ends the caller's turn, and the hard ceiling on one turn.
+  const TURN_SILENCE_MS = 2500;
+  const MAX_TURN_MS = 20000;
+
+  const stopEnergyTurnDetection = () => {
+    if (vadIntervalRef.current) {
+      clearInterval(vadIntervalRef.current);
+      vadIntervalRef.current = null;
+    }
+  };
+
+  // Record the caller's turn from the SINGLE persistent microphone stream.
+  // The previous code opened a second microphone here (and only when the browser
+  // had no speech recogniser), which is why the orb never saw real audio and why
+  // no recording existed to transcribe accurately.
+  const armUtteranceRecorder = () => {
+    const stream = vizStreamRef.current;
+    if (!stream || typeof MediaRecorder === 'undefined') {
+      mediaRecorderRef.current = null;
+      return;
+    }
+    try {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        try { mediaRecorderRef.current.stop(); } catch {}
+      }
+      // MediaRecorder cannot be restarted, so each turn gets a fresh one.
+      let recorder: MediaRecorder;
+      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+        recorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+      } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+        recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      } else {
+        recorder = new MediaRecorder(stream);
+      }
+      // Each recorder owns its OWN buffer. stop() flushes a final
+      // dataavailable asynchronously, and with a shared array that late flush
+      // landed in the NEXT turn's recording - a cross-turn contamination that
+      // put part of the previous utterance into the new one.
+      const buffer: Blob[] = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) buffer.push(e.data);
+      };
+      chunkBufferRef.current = buffer;
+      mediaRecorderRef.current = recorder;
+      recorder.start(100);
+    } catch (e) {
+      console.warn('Utterance recorder unavailable; falling back to the browser transcript:', e);
+      mediaRecorderRef.current = null;
+    }
+  };
+
+  // Energy-based turn detection.
+  // ROOT-CAUSE FIX (Kannada never sent / captions wrong): recognition.lang='kn-IN'
+  // is silently ignored by desktop Chrome, so recognition.onresult often never
+  // fires for Kannada. The old silence timer lived INSIDE onresult, so the turn
+  // was never dispatched at all. Turn-taking is now driven by real microphone
+  // energy, which works identically in all three languages.
+  const startEnergyTurnDetection = () => {
+    stopEnergyTurnDetection();
+    const stream = vizStreamRef.current;
+    if (!stream) return;
+
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+        audioContextRef.current = new AudioCtx();
+      }
+      const ctx = audioContextRef.current;
+      if (ctx.state === 'suspended') void ctx.resume();
+
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.2;
+      source.connect(analyser);
+
+      const buf = new Float32Array(analyser.fftSize);
+      const startedAt = Date.now();
+      let spoken = false;
+      let lastLoudAt = Date.now();
+
+      vadIntervalRef.current = setInterval(() => {
+        if (!isListeningRef.current) {
+          stopEnergyTurnDetection();
+          return;
+        }
+
+        analyser.getFloatTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+        const rms = Math.sqrt(sum / buf.length);
+
+        const now = Date.now();
+        if (rms > 0.012) {
+          spoken = true;
+          lastLoudAt = now;
+          hasSpokenRef.current = true;
+          lastSoundTimeRef.current = now;
+        }
+
+        // End of turn: the caller spoke and has now been quiet long enough.
+        if (spoken && now - lastLoudAt >= TURN_SILENCE_MS) {
+          stopEnergyTurnDetection();
+          if (isListeningRef.current) void stopListeningAndSend();
+          return;
+        }
+        // Safety net: never capture for ever.
+        if (now - startedAt >= MAX_TURN_MS) {
+          stopEnergyTurnDetection();
+          if (isListeningRef.current) void stopListeningAndSend();
+        }
+      }, 100);
+    } catch (e) {
+      console.warn('Energy turn detection unavailable:', e);
     }
   };
 
@@ -236,11 +324,15 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
         return resolve(null);
       }
 
+      // Pin the buffer to THIS recorder, so a later arm cannot swap it out
+      // from under an in-flight transcription.
+      const buffer = chunkBufferRef.current;
+
       recorder.onstop = async () => {
-        if (audioChunksRef.current.length === 0) return resolve(null);
+        if (!buffer || buffer.length === 0) return resolve(null);
         
         try {
-          const audioBlob = new Blob(audioChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
+          const audioBlob = new Blob(buffer, { type: recorder.mimeType || 'audio/webm' });
           if (audioBlob.size < 500) {
             return resolve(null); // Too short to be voice
           }
@@ -250,6 +342,9 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
             const formData = new FormData();
             formData.append('audio', audioBlob, 'speech.webm');
             formData.append('language', language);
+            // Seed Whisper with domain vocabulary for this language, so local food
+            // items and hotel names are not "corrected" into unrelated words.
+            formData.append('hint', MAIN_PAGE_STT_HINTS[language] || '');
 
             const res = await fetch('/api/stt', { method: 'POST', body: formData });
             const contentType = res.headers.get('content-type') || '';
@@ -295,9 +390,11 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
         return resolve(undefined);
       }
       
+      const buffer = chunkBufferRef.current;
+
       recorder.onstop = async () => {
-        if (audioChunksRef.current.length === 0) return resolve(undefined);
-        const audioBlob = new Blob(audioChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
+        if (!buffer || buffer.length === 0) return resolve(undefined);
+        const audioBlob = new Blob(buffer, { type: recorder.mimeType || 'audio/webm' });
         const formData = new FormData();
         formData.append('file', audioBlob);
         try {
@@ -543,16 +640,17 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     const textToSpeak = stripEmojis(text);
     if (!textToSpeak) return;
 
-    // 1ST PRIORITY: Browser Google Speech Synthesis (Instant, Fast, 0ms network latency!)
-    const browserSpoke = speakWithBrowserGoogle(textToSpeak, language);
-    if (browserSpoke) {
-      return;
-    }
+    // ROOT-CAUSE FIX ("you're not using any microsoft neural voices"): the
+    // browser's built-in speechSynthesis used to be tier 1 and it claimed EVERY
+    // English reply, so the robotic on-device voice spoke instead of the natural
+    // Microsoft Edge neural voice. Neural audio is now tried first and the
+    // on-device voice is a genuine last resort.
+    const generation = ++speakGenerationRef.current;
 
-    // 2ND PRIORITY: Pre-generated audio URL (if device lacks native Kannada voice)
-    if (audioUrl) {
+    const playNeural = async (url: string): Promise<boolean> => {
       try {
-        const audio = new Audio(audioUrl);
+        if (generation !== speakGenerationRef.current) return true; // turn cancelled
+        const audio = new Audio(url);
         audio.onplay = () => updateSpeakingState(true);
         audio.onended = () => {
           // Clear the ref as well, otherwise it still points at the finished
@@ -570,13 +668,25 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
         };
         activeAudioRef.current = audio;
         await audio.play();
-        return;
+        return true;
       } catch (e) {
-        console.warn("Direct audio URL playback notice:", e);
+        console.warn("Neural audio playback notice:", e);
+        activeAudioRef.current = null;
+        return false;
       }
-    }
+    };
 
-    // 3RD PRIORITY: Server TTS (/api/tts)
+    // 1ST PRIORITY: neural audio already generated alongside the reply
+    if (audioUrl && (await playNeural(audioUrl))) return;
+    if (generation !== speakGenerationRef.current) return;
+
+    // 2ND PRIORITY: neural voice from /api/tts (Edge), cached per language+text
+    const neuralKey = `${language}:${textToSpeak}`;
+    const cachedNeural = neuralAudioCacheRef.current.get(neuralKey);
+    if (cachedNeural && (await playNeural(cachedNeural))) return;
+    if (generation !== speakGenerationRef.current) return;
+
+    updateSpeakingState(true); // show progress while synthesising
     try {
       const res = await fetch('/api/tts', {
         method: 'POST',
@@ -587,28 +697,39 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
       const contentType = res.headers.get('content-type') || '';
       if (res.ok && contentType.includes('application/json')) {
         const data = await res.json();
-        if (data && data.audioBase64) {
-          const audio = new Audio(`data:audio/wav;base64,${data.audioBase64}`);
-          audio.onplay = () => updateSpeakingState(true);
-          audio.onended = () => {
-            updateSpeakingState(false);
-            setPlayingMsgId(null);
-          };
-          audio.onerror = () => {
-            updateSpeakingState(false);
-            setPlayingMsgId(null);
-          };
-          activeAudioRef.current = audio;
-          await audio.play();
-          return;
+        const url = data?.audioUrl || (data?.audioBase64 ? `data:audio/wav;base64,${data.audioBase64}` : '');
+        if (url) {
+          // Keep the cache bounded: each entry is a ~25KB inline audio URL.
+          if (neuralAudioCacheRef.current.size >= 40) {
+            const oldestKey = neuralAudioCacheRef.current.keys().next().value;
+            if (oldestKey) neuralAudioCacheRef.current.delete(oldestKey);
+          }
+          neuralAudioCacheRef.current.set(neuralKey, url);
+          if (await playNeural(url)) return;
         }
       }
     } catch (err) {
-      console.warn("Server TTS request notice (using browser speech fallback):", err);
+      console.warn("Server TTS request notice:", err);
     }
+
+    if (generation !== speakGenerationRef.current) return;
+
+    // 3RD PRIORITY - last resort only: the on-device browser voice.
+    console.warn("Neural voice unavailable - falling back to the on-device browser voice.");
+    if (speakWithBrowserGoogle(textToSpeak, language)) return;
+
+    updateSpeakingState(false);
+    setPlayingMsgId(null);
   };
 
   const stopListeningAndSend = async () => {
+    // Single-dispatch guard: the energy turn detector and the recogniser's own
+    // silence timer can both fire for the same utterance. Without this, each
+    // extra entry stopped an already-stopped recorder and fell through to the
+    // browser text, adding another identical user message to the chat.
+    if (!isListeningRef.current || turnDispatchedRef.current) return;
+    turnDispatchedRef.current = true;
+
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
@@ -632,52 +753,121 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     sessionPrefixRef.current = '';
     sessionTextRef.current = '';
 
-    // 1ST PRIORITY: Free native Browser Web Speech API (Chrome/Edge/Safari/Android/Kotlin-like)
-    // ROOT-CAUSE FIX (one sentence answered twice): the audio was previously
-    // re-transcribed through /api/stt AFTER the browser transcript had already
-    // been sent, so a single utterance could produce two user turns and the
-    // assistant answered it twice. One utterance now yields exactly one turn.
-    if (browserCaptured && !isHallucinatedText(browserCaptured)) {
-      setTranscript(browserCaptured);
-      transcriptRef.current = '';
-      handleSendMessage(browserCaptured);
-      return;
-    }
-
-    // 2ND PRIORITY: Backend STT fallback (only if MediaRecorder was used on browsers lacking SpeechRecognition)
+    // 1ST PRIORITY: server Whisper on the recorded audio.
+    // ROOT-CAUSE FIX ("Kannada: understand perfectly but captions are incorrect"):
+    // the browser recogniser used to be the primary transcript AND the caption.
+    // Desktop Chrome ignores recognition.lang='kn-IN', so the caption was
+    // garbled while the server model had no trouble. Whisper is now the source
+    // of truth for both the caption and the dispatched text.
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       setIsLoading(true);
+      setTranscript('Recognising your speech...');
       const serverText = await stopAndTranscribeAudio();
       setIsLoading(false);
 
-      if (serverText && serverText.trim() && !isHallucinatedText(serverText.trim())) {
-        setTranscript(serverText.trim());
-        transcriptRef.current = '';
-        handleSendMessage(serverText.trim());
+      // ROOT-CAUSE FIX ("I spoke 3 words, it showed them 3 to 7 times"): the
+      // server transcript was dispatched completely raw, so whatever repetition
+      // the recogniser produced went straight into the caption, the chat message
+      // and the LLM prompt. Every path now goes through the same collapsing
+      // (near-exact repeated copies included) before anything is shown or sent.
+      const rawFinal = serverText && serverText.trim() && !isHallucinatedText(serverText.trim())
+        ? serverText.trim()
+        : browserCaptured;
+      // Collapse repeats, then repair digit homophones ("I 8 food" -> "I ate food")
+      // before it becomes the caption, the chat message or memory.
+      const finalText = normalizeRecognizedText(collapseRepetitions(rawFinal)).trim();
+
+      transcriptRef.current = '';
+      if (finalText) {
+        setTranscript(finalText);
+        // Exactly ONE dispatch per utterance (the audio is never sent to a
+        // second transcription path as well).
+        handleSendMessage(finalText);
       } else {
         setTranscript('');
-        transcriptRef.current = '';
       }
-    } else {
-      setTranscript('');
-      transcriptRef.current = '';
+      return;
     }
+
+    // 2ND PRIORITY: no recording available - use the browser preview text.
+    // This string is exactly where the "3 words shown 3 to 7 times" repeats came
+    // from: Chrome replays the same audio across its silent end/restart cycles and
+    // re-transcribes it slightly differently, so the same phrase accumulated. It
+    // is collapsed here too, so no path can emit repetition.
+    const fallbackText = normalizeRecognizedText(collapseRepetitions(browserCaptured)).trim();
+    if (fallbackText && !isHallucinatedText(fallbackText)) {
+      setTranscript(fallbackText);
+      transcriptRef.current = '';
+      handleSendMessage(fallbackText);
+      return;
+    }
+
+    transcriptRef.current = '';
+    setTranscript('');
   };
 
   // One shared microphone stream feeds the orb visualiser. It is opened once and
   // kept warm (the recogniser itself owns its own capture), so the sphere shows
   // the caller's real voice energy instead of synthetic waves.
-  const ensureVizStream = async () => {
-    if (vizStreamRef.current && vizStreamRef.current.active) return;
+  const ensureVizStream = async (): Promise<MediaStream | null> => {
+    if (vizStreamRef.current && vizStreamRef.current.active) return vizStreamRef.current;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
       vizStreamRef.current = stream;
       setMicStream(stream);
+      setMicError(null);
+      return stream;
     } catch (e) {
-      // Non-fatal: the orb falls back to its synthetic animation.
-      console.warn('Orb visualiser microphone notice:', e);
+      console.warn('Microphone access error:', e);
+      setMicError('Microphone access is unavailable or blocked. Please check browser permissions or type your question below.');
+      return null;
+    }
+  };
+
+  /**
+   * Start a brand-new conversation.
+   *
+   * The conversation id used to be created once and never rotated, so every
+   * session appended to one endless thread and an unrelated topic kept the old
+   * context. This closes the old thread server-side (so it cannot be re-adopted
+   * as "latest"), rotates the id, and clears the on-screen history.
+   */
+  const startNewConversation = () => {
+    const previousId = conversationIdRef.current;
+
+    stopSpeaking();
+    try {
+      recognitionRef.current?.abort?.();
+    } catch {}
+    stopEnergyTurnDetection();
+    updateListeningState(false);
+    autoListenRef.current = false;
+    turnDispatchedRef.current = true; // nothing may dispatch from the old thread
+
+    const nextId = `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    conversationIdRef.current = nextId;
+    try {
+      localStorage.setItem('vox_conversation_id', nextId);
+    } catch {}
+
+    queryCacheRef.current.clear();
+    setMessages([]);
+    setTranscript('');
+    transcriptRef.current = '';
+    sessionPrefixRef.current = '';
+    sessionTextRef.current = '';
+    setComplaintDraft(null);
+
+    // Best effort: mark the previous thread closed for this caller. The new
+    // thread is already in place, so a failure here cannot break the chat.
+    if (previousId) {
+      fetch('/api/chat/new', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversationId: previousId, profile }),
+      }).catch(() => {});
     }
   };
 
@@ -704,40 +894,42 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     accumulatedFinalRef.current = '';
     sessionPrefixRef.current = '';
     sessionTextRef.current = '';
+    // A new listening turn: allow exactly one dispatch for it.
+    turnDispatchedRef.current = false;
     // The caller is now driving the orb by voice: re-arm listening automatically
     // once the assistant stops speaking.
     autoListenRef.current = true;
     updateListeningState(true);
 
-    // ROOT-CAUSE FIX (orb not reacting to the caller's voice): the ParticleBall
-    // visualiser is fed by micStream, but micStream was only ever created inside
-    // startRecording(), which is skipped whenever the native SpeechRecognition
-    // exists. So on desktop Chrome the orb always received null and animated
-    // synthetic waves instead of the real microphone.
-    void ensureVizStream();
+    // One persistent microphone stream now serves everything: the orb
+    // visualiser, the utterance recording that gets transcribed by Whisper, and
+    // the energy-based turn detector. (Previously micStream was only created
+    // inside startRecording(), which is skipped whenever the native
+    // SpeechRecognition exists - so on desktop Chrome the orb always received
+    // null and animated synthetic waves.)
+    const stream = await ensureVizStream();
+    if (!stream) {
+      updateListeningState(false);
+      autoListenRef.current = false;
+      return;
+    }
 
+    armUtteranceRecorder();
+    startEnergyTurnDetection();
+
+    // The browser recogniser is now only a live preview: it is called off as the
+    // authoritative transcript because recognition.lang is silently ignored for
+    // Kannada/Hindi on desktop Chrome, which produced the wrong captions.
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    // Direct Browser Web Speech API (Native, instant, 100% Kotlin-like clean behavior)
-    // Avoid starting MediaRecorder simultaneously to eliminate mic hardware conflict & double "ding ding" sound on Chrome/Android!
     if (SpeechRecognition && recognitionRef.current) {
       try {
         recognitionRef.current.start();
       } catch (e: any) {
-        // "already started" is harmless. Anything else means we are NOT actually
-        // listening, so never leave the UI claiming that we are.
+        // "already started" is harmless; the energy detector drives the turn, so
+        // a failure here must not disable listening.
         if (!/already started|InvalidState/i.test(String(e?.message || e))) {
-          console.warn("Native speech recognition start notice:", e);
-          updateListeningState(false);
-          autoListenRef.current = false;
+          console.warn("Native speech recognition preview notice (non-fatal):", e);
         }
-      }
-    } else {
-      // Fallback for browsers without native SpeechRecognition (e.g. Firefox desktop)
-      try {
-        await startRecording();
-      } catch (recErr) {
-        console.warn("Audio recorder initialization notice:", recErr);
       }
     }
   };
@@ -852,7 +1044,8 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
           history: recentHistory,
           language, 
           profile,
-          chatCount: userTurnCount
+          chatCount: userTurnCount,
+          conversationId: conversationIdRef.current || undefined
         })
       });
 
@@ -871,14 +1064,26 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
       const assistantReply = data.response || "I have received your query. How else may I assist you?";
       const spokenVoiceText = data.spokenText || assistantReply;
 
-      // Store in memory cache
-      queryCacheRef.current.set(cacheKey, {
-        response: assistantReply,
-        spokenText: spokenVoiceText,
-        audioUrl: data.audioUrl || undefined,
-        isComplaintDraft: !!data.isComplaintDraft,
-        markdownReport: data.markdownReport
-      });
+      // Adopt the server's conversation id, so memory keeps working even if the
+      // server had to create one for us.
+      if (data.conversationId && data.conversationId !== conversationIdRef.current) {
+        conversationIdRef.current = String(data.conversationId);
+        try {
+          localStorage.setItem('vox_conversation_id', conversationIdRef.current);
+        } catch {}
+      }
+
+      // Cache only context-free replies. A recall answer ("here is what you told
+      // me") is specific to this conversation and must never be replayed.
+      if (!data.recalled) {
+        queryCacheRef.current.set(cacheKey, {
+          response: assistantReply,
+          spokenText: spokenVoiceText,
+          audioUrl: data.audioUrl || undefined,
+          isComplaintDraft: !!data.isComplaintDraft,
+          markdownReport: data.markdownReport
+        });
+      }
 
       const assistantMsg: VoiceInteraction = { 
         id: (Date.now() + 1).toString(), 
@@ -1171,6 +1376,17 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
                     );
                   })}
                 </div>
+
+                {/* Start a fresh thread: rotates the conversation id so the
+                    assistant stops seeing the previous topic. */}
+                <button
+                  onClick={startNewConversation}
+                  className="p-1.5 rounded-xl bg-white/20 hover:bg-white/30 text-white transition-colors border border-white/30"
+                  title="New conversation"
+                  aria-label="New conversation"
+                >
+                  <Plus size={17} />
+                </button>
 
                 {/* Corner Minimize Button */}
                 <button
