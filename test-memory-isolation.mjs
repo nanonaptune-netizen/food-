@@ -30,7 +30,8 @@ async function chat(message, phone, conversationId) {
   return res.json();
 }
 
-const saysNothingYet = (r) => /haven't told me anything yet/i.test(String(r.response || ''));
+/** The honest "I have nothing from you" refusal, in the current wording. */
+const saysNothingYet = (r) => /haven't told me anything/i.test(String(r.response || ''));
 
 // wait for the server
 let up = false;

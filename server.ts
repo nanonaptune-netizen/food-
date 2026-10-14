@@ -209,7 +209,12 @@ async function initDB() {
   try {
     const turso = getTurso();
     if (!turso) {
-      console.warn("Turso DB URL not set in environment; skipping DB initialization.");
+      console.warn(
+        "Turso DB URL not set in environment; skipping DB initialization. " +
+        "Conversation memory will live only inside this process: it is lost on restart and is " +
+        "NOT shared between serverless instances, so the assistant will appear to forget earlier " +
+        "messages. Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to persist it. See GET /api/health."
+      );
       return;
     }
     await turso.execute(`
@@ -1528,39 +1533,102 @@ async function saveConversation(record: ConversationRecord): Promise<void> {
 // "What did I say?" must never be answered with "I don't know". When the caller
 // asks to be reminded, the stored turns are replayed verbatim - no model guess.
 const RECALL_PATTERNS = [
+  // Anything explicitly about the CALLER'S OWN words.
   /\bwhat did i (?:say|tell|mention|report|complain|ask)\b/i,
-  /\bwhat (?:was|were) my (?:words|complaint|problem)\b/i,
+  /\bwhat (?:was|were) my (?:words|complaint|problem|issue)\b/i,
   /\b(?:repeat|tell me) (?:what|that) i (?:said|told)\b/i,
-  /\bdo you remember what i\b/i,
+  /\bdo you (?:remember|recall|know) what i\b/i,
+  /\bwhat do you (?:remember|recall|know) about (?:me|my)\b/i,
+  /\bwhat have i (?:told|said to) you\b/i,
+  /\byou (?:remember|recall) (?:that|this|what i)\b/i,
+  /\b(?:did|do) i (?:already )?(?:tell|say|mention)\b/i,
+  /\bwhat did i just say\b/i,
+  // Kannada
   /ನಾನು\s*ಏನು\s*ಹೇಳಿದೆ/,
   /ನಾನು\s*ಹೇಳಿದ್ದು/,
   /ನನ್ನ\s*ಮಾತು/,
   /ನೆನಪಿದೆಯಾ/i,
+  /ನೆನಪಿದೆ/i,
+  /ನೆನಪಾಗಿದೆಯಾ/i,
+  /ಜ್ಞಾಪಕ/i,
+  // Hindi
   /(?:मैंने|मैने)\s*क्या\s*(?:कहा|बताया)/,
   /मुझे\s*याद/i,
+  /याद\s*है/i,
+  /याद\s*है\s*आपको/i,
 ];
 
+/**
+ * Does the caller want to be reminded of what they said?
+ *
+ * ROOT CAUSE of "it said I remembered but didn't tell me anything": the pattern
+ * was `\bdo you remember what i\b`, so a bare "do you remember?" never matched and
+ * went to the model instead, which cheerfully agreed it remembered and then asked
+ * "how can I help you?".
+ *
+ * A bare remember-question counts, but "do you remember the FSSAI rules?" must
+ * still be answered as a normal question - so an unqualified remember-phrase is
+ * only a recall request when nothing substantial follows it.
+ */
 function wantsRecall(text: string): boolean {
   const t = String(text || "").trim();
   if (!t) return false;
-  return RECALL_PATTERNS.some((re) => re.test(t));
+  if (RECALL_PATTERNS.some((re) => re.test(t))) return true;
+
+  const bare = /\b(?:do|did|can|could|would)\s+you\s+(?:remember|recall)\b(.*)$/i.exec(t);
+  if (!bare) return false;
+
+  // Strip ALL punctuation: a trailing "?" must not count as content, otherwise
+  // "do you remember?" is not recognised as a bare recall request.
+  const rest = bare[1].replace(/[^\p{L}\p{N}\s]/gu, " ").trim();
+  const restWords = rest.split(/\s+/).filter(Boolean);
+  if (restWords.length === 0) return true;                     // "do you remember?"
+  return restWords.length <= 3 && /^(?:me|that|this|it|anything|something|now)\b/i.test(rest);
+}
+
+/**
+ * Is this utterance something the caller TOLD us, rather than meta-conversation?
+ *
+ * ROOT CAUSE of "it said I remembered but didn't tell me anything": the recall
+ * reply listed the caller's most recent turns verbatim, and once they had asked a
+ * few times ("do you remember?", "what did I say?"), those questions filled the
+ * list and pushed out the actual complaint. The answer was then a list of the
+ * caller's own questions - which reads as "I remember nothing".
+ */
+function isSubstantiveUtterance(text: string): boolean {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  if (wantsRecall(t)) return false;        // "what did I say?" - a question, not content
+  if (isIvrConfirmation(t)) return false;  // "yes" / "ok" / "sari" - not content
+  const words = t.replace(/\s+/g, " ").split(" ").filter(Boolean);
+  return words.length >= 3;                // "hello", "yes please" carry nothing
 }
 
 function buildRecallReply(record: ConversationRecord | null, langName: string, currentText: string): string {
-  const previous = (record?.turns || [])
+  const current = currentText.trim().toLowerCase();
+
+  const seen = new Set<string>();
+  const provided = (record?.turns || [])
     .filter((t) => t.role === "user")
     .map((t) => t.text.trim())
-    .filter((t) => t && t.toLowerCase() !== currentText.trim().toLowerCase());
+    .filter((t) => t && t.toLowerCase() !== current)
+    .filter((t) => isSubstantiveUtterance(t))
+    .filter((t) => {
+      const key = t.toLowerCase();
+      if (seen.has(key)) return false;     // the caller repeating themselves
+      seen.add(key);
+      return true;
+    });
 
-  if (!previous.length) {
-    if (langName === "Kannada") return "ಈ ಸಂಭಾಷಣೆಯಲ್ಲಿ ನೀವು ಇನ್ನೂ ಏನನ್ನೂ ಹೇಳಿಲ್ಲ. ದಯವಿಟ್ಟು ತಮ್ಮ ಸಮಸ್ಯೆಯನ್ನು ತಿಳಿಸಿ.";
-    if (langName === "Hindi") return "इस बातचीत में आपने अभी तक कुछ नहीं कहा। कृपया अपनी समस्या बताएं।";
-    return "You haven't told me anything yet in this conversation. Please describe your issue.";
+  if (!provided.length) {
+    if (langName === "Kannada") return "ಈ ಸಂಭಾಷಣೆಯಲ್ಲಿ ನೀವು ಇನ್ನೂ ನಿಮ್ಮ ಸಮಸ್ಯೆಯನ್ನು ವಿವರಿಸಿಲ್ಲ. ದಯವಿಟ್ಟು ಏನಾಯಿತು ಎಂದು ತಿಳಿಸಿ.";
+    if (langName === "Hindi") return "इस बातचीत में आपने अभी तक अपनी समस्या नहीं बताई। कृपया बताएं कि क्या हुआ।";
+    return "You haven't told me anything about the problem yet in this conversation. Please describe what happened.";
   }
 
-  const listed = previous.slice(-6).map((t) => `• ${t}`).join("\n");
+  const listed = provided.slice(-6).map((t) => `• ${t}`).join("\n");
 
-  if (langName === "Kannada") return `ನೀವು ಈವರೆಗೆ ಹೇಳಿದ್ದು:\n${listed}\n\nಇದರಲ್ಲಿ ಏನಾದರೂ ಸೇರಿಸಲು ಬಯಸುವಿರಾ?`;
+  if (langName === "Kannada") return `ನೀವು ಈವರೆಗೆ ತಿಳಿಸಿದ್ದು:\n${listed}\n\nಇದರಲ್ಲಿ ಏನಾದರೂ ಸೇರಿಸಲು ಬಯಸುವಿರಾ?`;
   if (langName === "Hindi") return `आपने अब तक यह बताया है:\n${listed}\n\nइसमें कुछ जोड़ना चाहेंगे?`;
   return `Here is what you've told me so far:\n${listed}\n\nWould you like to add anything to that?`;
 }
@@ -1709,6 +1777,10 @@ app.post("/api/chat", chatLimit, async (req, res) => {
     }
   }
 
+  // Whether anything is actually known - drives the honesty rules below, so the
+  // model can never agree that it "remembers" an empty conversation.
+  const hasAnyMemory = !!(knownFacts || priorUserTurns.length || alreadyAsked.length || crossSurfaceMemory);
+
   const memoryBlock = [
     knownFacts ? `FACTS ALREADY ESTABLISHED (treat as known, never ask again):\n${knownFacts}` : 'FACTS ALREADY ESTABLISHED: none yet.',
     priorUserTurns.length
@@ -1778,6 +1850,14 @@ CORE BEHAVIOR INSTRUCTIONS:
 
 === CONVERSATION MEMORY (this is what makes you sound like a person who was listening) ===
 ${memoryBlock}
+
+=== HONESTY ABOUT MEMORY (never break these) ===
+- The memory above is the ONLY thing you remember. There is no other history you can access.
+- ${hasAnyMemory
+  ? "The memory above is not empty, so use it naturally. But still never claim to recall a specific thing unless that thing is actually written above."
+  : "The memory above is EMPTY. You have NOT been told anything yet in this conversation. If the caller asks whether you remember, do NOT say \"yes, I remember\" - say plainly that they have not told you anything yet and ask them to describe the issue. Saying you remember while having nothing is the worst possible answer."}
+- Never invent a place, person, food item, date or complaint reference. If it is not above, you do not know it - ask, or say you do not know.
+- If the caller asks what they said earlier and it is not in the memory above, say you do not have it and ask them to repeat it.
 
 Always respond warmly, naturally, and directly to what the user actually said.`;
 
@@ -3126,6 +3206,36 @@ app.post("/api/complaints/add", uploadLimit, async (req, res) => {
     console.error("Error saving complaint:", error);
     res.status(500).json({ error: error.message });
   }
+});
+
+// Diagnostics: answers "is my memory actually being stored, or is this a database
+// problem?" in one request. Deliberately reports no credentials.
+app.get("/api/health", async (_req, res) => {
+  const turso = getTurso();
+  let conversationsInDb: number | null = null;
+  let dbError: string | null = null;
+
+  if (turso) {
+    try {
+      const result = await turso.execute("SELECT COUNT(*) AS c FROM conversations");
+      conversationsInDb = Number((result.rows[0] as any)?.c || 0);
+    } catch (e: any) {
+      dbError = e?.message || "query failed";
+    }
+  }
+
+  res.json({
+    ok: true,
+    database: turso ? "configured" : "missing",
+    memoryIsDurable: !!turso,
+    conversationsInDb,
+    conversationsInMemory: conversationMemory.size,
+    dbError,
+    llmKeyConfigured: !!getGroqKey(),
+    note: turso
+      ? "Conversation memory is stored in the database, so it is shared between instances and survives a restart."
+      : "TURSO_DATABASE_URL is NOT set. Memory lives only inside this running server process: it is LOST on every restart, and on serverless hosting each instance keeps its own copy, so consecutive messages can appear to forget. This is the cause of 'it forgot what I said'.",
+  });
 });
 
 app.get("/api/complaints", async (req, res) => {

@@ -578,3 +578,116 @@ PASS  "room 8 was dirty" -> "room eight was dirty"    PASS  "I waited 9 minutes"
 - Shared-device caveat: if two people use the same browser and the *same phone number* is
   configured in the profile, the second person sees the first's thread — the app has one
   profile per install. Different phone numbers are now fully separated.
+
+---
+
+# Round 6 — "it said I remembered, but didn't tell me anything"
+
+Reported: *"if I asked do you remember, it said I remembered but not tell anything and
+said how can I help you? why? is it a database issue?"*
+
+**Partly a bug, partly the database — both are real, and I could reproduce the first one.**
+
+## 22. Bug A: "do you remember?" never reached the memory code
+
+The recall trigger was `\bdo you remember what i\b` — it required the words **"what i"**
+to follow. So a bare *"do you remember?"* did not match, fell through to the model, and
+the model — having no instruction to be careful — agreed it remembered and then asked
+"how can I help you?". That is exactly what you saw.
+
+The patterns now cover natural phrasing: *do you remember / did you remember / can you
+recall / do you remember me / what do you remember about me / you remember that / did I
+already tell you*, plus Kannada and Hindi equivalents (*ನೆನಪಿದೆಯಾ, ನೆನಪಿದೆ, ಜ್ಞಾಪಕ,
+याद है, मुझे याद*).
+
+A bare remember-question is treated as a recall request **only when nothing substantial
+follows it**, so *"do you remember what FSSAI is?"* is still answered as a normal
+question rather than a memory lookup. Verified.
+
+## 23. Bug B (the bigger one): it listed your *questions* instead of your complaint
+
+This is the part that made it look like it remembered nothing. The recall reply listed
+your **last 6 turns verbatim**. So the moment you asked twice, those questions filled the
+list and pushed the actual complaint out — and the "memory" answer became a list of your
+own questions:
+
+```
+Here is what you've told me so far:
+• do you remember?
+• what did I say?
+• did you remember?
+```
+
+It now lists only **substantive statements**: questions, bare acknowledgements
+("yes", "ok", "sari") and under-3-word fragments are filtered out, duplicates removed. If
+nothing substantive remains it says so honestly instead of pretending.
+
+## 24. Bug C: nothing stopped the model from claiming memory it didn't have
+
+The prompt now carries a **honesty block driven by whether memory is actually empty**:
+
+- Memory empty → *"You have NOT been told anything yet... do NOT say 'yes, I remember'."*
+- Memory present → *"never claim to recall a specific thing unless it is actually written above."*
+
+Plus: never invent a place, food item, date or complaint reference.
+
+## 25. The database question — yes, this can be your real problem
+
+If `TURSO_DATABASE_URL` is not set, conversation memory lives **only inside the running
+server process**. It is lost on every restart, and on serverless hosting each instance
+keeps its own copy — so consecutive messages can land on different instances and appear
+to forget. That is indistinguishable from "the AI is dumb", and it is a database issue.
+
+**Check it in one request:**
+
+```
+GET https://<your-deployment>/api/health
+```
+
+It reports `database: "configured" | "missing"`, `memoryIsDurable`, how many
+conversations are in the DB vs in memory, and the LLM key state — no credentials
+exposed. In this local environment it returns:
+
+```
+database=missing  durable=false  inMemory=43  inDb=null
+note: TURSO_DATABASE_URL is NOT set. Memory lives only inside this running server
+process: it is LOST on every restart ... This is the cause of 'it forgot what I said'.
+```
+
+The startup log now says the same thing, so a missing database can no longer be missed.
+
+## Verified
+
+| Check | Result |
+|---|---|
+| `test-recall-intent.mjs` (14 cases) | **14 / 14** |
+| `test-memory-isolation.mjs` | **9 / 9** (re-run after the recall change) |
+| `test-repetition-collapse.ts` | **52 / 52** |
+| `tsc --noEmit` | clean (only the pre-existing `firebase.ts` errors) |
+| `npm run build` | passes |
+
+```
+PASS  "do you remember?" on an EMPTY conversation refuses, does not claim
+PASS  "do you remember?" recalls the real words
+PASS  "did you remember?" recalls the real words
+PASS  "can you recall?" recalls the real words
+PASS  repeated asks still return the content, not the questions
+PASS  Kannada "ನೆನಪಿದೆಯಾ?" recalls
+PASS  Hindi "क्या आपको याद है?" recalls
+PASS  "do you remember what FSSAI is?" is NOT treated as a memory lookup
+```
+
+## One side effect worth knowing
+
+The per-IP rate limit I added earlier (60 requests/minute on `/api/chat`) throttles rapid
+automated testing — my own test suite started receiving HTTP 429 until I spaced the runs
+out. A human conversation never comes close to that limit, so this is expected
+behaviour, not a bug.
+
+## Files changed in this round
+
+| File | Change |
+|---|---|
+| `server.ts` | Broadened `RECALL_PATTERNS` + bare remember-question handling, `isSubstantiveUtterance`, rewritten `buildRecallReply`, memory honesty block driven by `hasAnyMemory`, `GET /api/health`, clearer missing-database startup warning |
+| `test-recall-intent.mjs` | New — 14-case recall-intent and honesty suite |
+| `test-memory-isolation.mjs` | Assertion updated to the new refusal wording |
