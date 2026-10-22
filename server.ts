@@ -1330,10 +1330,29 @@ type ConversationRecord = {
   language: string;
   profile: any;
   turns: ConversationTurn[];
+  /**
+   * Subjects this conversation has covered, most recent first. Persisted with the
+   * conversation so a follow-up ("how does it work?") still knows what "it" is
+   * after a reload, a restart, or a different server instance.
+   */
+  topics?: string[];
   /** Set when the caller starts a new thread, so it is not re-adopted. */
   closedAt?: number;
   updatedAt: number;
 };
+
+/**
+ * Topic memory rides in the existing `facts` column, so no schema migration is
+ * needed on an already-deployed database.
+ */
+function parseStoredTopics(raw: any): string[] {
+  try {
+    const parsed = raw ? JSON.parse(String(raw)) : null;
+    return normalizeTopicList(parsed?.topics);
+  } catch {
+    return [];
+  }
+}
 
 const conversationMemory = new Map<string, ConversationRecord>();
 const MAX_STORED_TURNS = 40;
@@ -1389,6 +1408,7 @@ async function loadConversation(id: string, phone: string): Promise<Conversation
       language: String(row.language || "English"),
       profile: row.profile ? JSON.parse(String(row.profile)) : {},
       turns: row.turns ? JSON.parse(String(row.turns)) : [],
+      topics: parseStoredTopics(row.facts),
       closedAt: row.closedAt ? Number(row.closedAt) : undefined,
       updatedAt: Number(row.updatedAt || Date.now()),
     };
@@ -1468,6 +1488,7 @@ async function findLatestConversationForPhone(phone: string): Promise<Conversati
       language: String(row.language || "English"),
       profile: row.profile ? JSON.parse(String(row.profile)) : {},
       turns: row.turns ? JSON.parse(String(row.turns)) : [],
+      topics: parseStoredTopics(row.facts),
       updatedAt: Number(row.updatedAt || Date.now()),
     };
     conversationMemory.set(record.id, record);
@@ -1519,7 +1540,7 @@ async function saveConversation(record: ConversationRecord): Promise<void> {
         normalizePhone(record.phone),
         record.language,
         JSON.stringify(record.profile || {}),
-        "",
+        JSON.stringify({ topics: record.topics || [] }),
         JSON.stringify(record.turns),
         record.closedAt || 0,
         record.updatedAt,
@@ -1633,6 +1654,441 @@ function buildRecallReply(record: ConversationRecord | null, langName: string, c
   return `Here is what you've told me so far:\n${listed}\n\nWould you like to add anything to that?`;
 }
 
+// ---------------------------------------------------------------------------
+// TOPIC MEMORY - what is this conversation actually ABOUT?
+//
+// ROOT CAUSE of "I asked what FSSAI is, then asked how it works, and it
+// explained the APP instead": the caller's turns were stored, but the SUBJECT of
+// the conversation never was. A follow-up built on a pronoun ("how does it
+// work?") therefore had no antecedent at all, so the model resolved "it" to the
+// only thing in front of it - the assistant itself.
+//
+// The fix is an explicit topic ledger: every turn is scanned for known subjects,
+// the most recently mentioned one becomes the CURRENT TOPIC, that topic is
+// persisted with the conversation AND mirrored into the browser, and follow-ups
+// are resolved from it. The reference text below is also injected into the
+// prompt, so answers come from gathered information rather than a guess.
+// ---------------------------------------------------------------------------
+
+type LangCode = "en" | "hi" | "kn";
+
+function toLangCode(langName: string): LangCode {
+  const l = String(langName || "").toLowerCase();
+  if (l.startsWith("kn") || l.includes("kannada")) return "kn";
+  if (l.startsWith("hi") || l.includes("hindi")) return "hi";
+  return "en";
+}
+
+type TopicKey = "fssai" | "licence" | "complaint" | "hygiene" | "penalty" | "packaged" | "app";
+
+type TopicEntry = {
+  key: TopicKey;
+  /** Whole-word patterns that put this topic on the table. No /g flag. */
+  patterns: RegExp[];
+  label: Record<LangCode, string>;
+  definition: Record<LangCode, string>;
+  works: Record<LangCode, string>;
+  more: Record<LangCode, string>;
+};
+
+const TOPIC_LIBRARY: TopicEntry[] = [
+  {
+    key: "fssai",
+    patterns: [
+      /\bfssai\b/i,
+      /\bfood\s+safety\s+and\s+standards\s+authority\b/i,
+      /ಎಫ್\s*ಎಸ್\s*ಎಸ್\s*ಎಐ|ಆಹಾರ\s*ಸುರಕ್ಷತೆ\s*ಮತ್ತು\s*ಗುಣಮಟ್ಟ\s*ಪ್ರಾಧಿಕಾರ/,
+      /खाद्य\s*सुरक्षा\s*और\s*मानक\s*प्राधिकरण/,
+    ],
+    label: {
+      en: "FSSAI (Food Safety and Standards Authority of India)",
+      hi: "FSSAI (भारतीय खाद्य सुरक्षा और मानक प्राधिकरण)",
+      kn: "FSSAI (ಭಾರತೀಯ ಆಹಾರ ಸುರಕ್ಷತೆ ಮತ್ತು ಗುಣಮಟ್ಟ ಪ್ರಾಧಿಕಾರ)",
+    },
+    definition: {
+      en: "FSSAI is the Food Safety and Standards Authority of India - a statutory body under the Ministry of Health and Family Welfare, created by the Food Safety and Standards Act, 2006. It sets the science-based standards that food sold in India must meet, and regulates food businesses across the country.",
+      hi: "FSSAI का पूरा नाम भारतीय खाद्य सुरक्षा और मानक प्राधिकरण है। यह स्वास्थ्य और परिवार कल्याण मंत्रालय के अधीन खाद्य सुरक्षा और मानक अधिनियम, 2006 के तहत बनी एक सांविधिक संस्था है। यह भारत में बिकने वाले भोजन के मानक तय करती है और खाद्य कारोबारों को नियंत्रित करती है।",
+      kn: "FSSAI ಎಂದರೆ ಭಾರತೀಯ ಆಹಾರ ಸುರಕ್ಷತೆ ಮತ್ತು ಗುಣಮಟ್ಟ ಪ್ರಾಧಿಕಾರ. ಇದು ಆರೋಗ್ಯ ಮತ್ತು ಕುಟುಂಬ ಕಲ್ಯಾಣ ಸಚಿವಾಲಯದ ಅಡಿಯಲ್ಲಿ ಆಹಾರ ಸುರಕ್ಷತೆ ಮತ್ತು ಗುಣಮಟ್ಟ ಕಾಯ್ದೆ, 2006 ರ ಮೂಲಕ ಸ್ಥಾಪನೆಯಾದ ಸರ್ಕಾರಿ ಪ್ರಾಧಿಕಾರ. ಇದು ಭಾರತದಲ್ಲಿ ಮಾರಾಟವಾಗುವ ಆಹಾರದ ಮಾನದಂಡಗಳನ್ನು ನಿಗದಿಪಡಿಸಿ, ಆಹಾರ ಉದ್ಯಮಗಳನ್ನು ನಿಯಂತ್ರಿಸುತ್ತದೆ.",
+    },
+    works: {
+      en: "FSSAI works through four main functions: it sets standards for what food may contain and how it must be labelled; it registers or licenses every food business through the State food safety departments; it inspects kitchens and outlets and has food samples tested in notified laboratories; and where a rule is broken it issues improvement notices, fines or prosecutions, and can order a recall of unsafe food.",
+      hi: "FSSAI मुख्य रूप से चार काम करता है - भोजन की गुणवत्ता और लेबलिंग के मानक तय करना; हर खाद्य कारोबार का पंजीकरण या लाइसेंस देना; रसोई और दुकानों की जाँच कराना तथा भोजन के नमूनों की प्रयोगशाला में जाँच कराना; और नियम टूटने पर सुधार नोटिस, जुर्माना या मुकदमा करना तथा असुरक्षित भोजन वापस मंगाना।",
+      kn: "FSSAI ಮುಖ್ಯವಾಗಿ ನಾಲ್ಕು ಕೆಲಸ ಮಾಡುತ್ತದೆ - ಆಹಾರದ ಗುಣಮಟ್ಟ ಮತ್ತು ಲೇಬಲ್ ಮಾನದಂಡಗಳನ್ನು ನಿಗದಿಪಡಿಸುವುದು; ಪ್ರತಿ ಆಹಾರ ಉದ್ಯಮಕ್ಕೆ ನೋಂದಣಿ ಅಥವಾ ಪರವಾನಗಿ ನೀಡುವುದು; ಅಡುಗೆಮನೆ ಮತ್ತು ಅಂಗಡಿಗಳ ತಪಾಸಣೆ ಹಾಗೂ ಆಹಾರ ಮಾದರಿಗಳ ಪ್ರಯೋಗಾಲಯ ಪರೀಕ್ಷೆ; ಮತ್ತು ನಿಯಮ ಉಲ್ಲಂಘನೆಯಾದರೆ ಸುಧಾರಣಾ ನೋಟಿಸ್, ದಂಡ ಅಥವಾ ಮೊಕದ್ದಮೆ ಜಾರಿಗೊಳಿಸಿ ಅಸುರಕ್ಷಿತ ಆಹಾರವನ್ನು ಮರುಪಡೆಯಲು ಆದೇಶಿಸುವುದು.",
+    },
+    more: {
+      en: "Food businesses are graded by size into registration, State licence or Central licence, and a consumer can complain to FSSAI or to the State food safety department, which then inspects the premises and tests samples.",
+      hi: "खाद्य कारोबार आकार के अनुसार पंजीकरण, राज्य लाइसेंस या केंद्रीय लाइसेंस में बाँटे जाते हैं, और उपभोक्ता FSSAI या राज्य खाद्य सुरक्षा विभाग में शिकायत कर सकते हैं, जिसके बाद जाँच और नमूना परीक्षण होता है।",
+      kn: "ಆಹಾರ ಉದ್ಯಮಗಳು ಗಾತ್ರದ ಆಧಾರದಲ್ಲಿ ನೋಂದಣಿ, ರಾಜ್ಯ ಪರವಾನಗಿ ಅಥವಾ ಕೇಂದ್ರ ಪರವಾನಗಿ ಎಂದು ವಿಂಗಡಿಸಲಾಗುತ್ತದೆ. ಗ್ರಾಹಕರು FSSAI ಅಥವಾ ರಾಜ್ಯ ಆಹಾರ ಸುರಕ್ಷತಾ ಇಲಾಖೆಗೆ ದೂರು ನೀಡಬಹುದು; ನಂತರ ತಪಾಸಣೆ ಮತ್ತು ಮಾದರಿ ಪರೀಕ್ಷೆ ನಡೆಯುತ್ತದೆ.",
+    },
+  },
+  {
+    key: "licence",
+    patterns: [
+      /\blicen[cs]e\b/i,
+      /\blicen[cs]ing\b/i,
+      /\bregistration\b/i,
+      /\bfoscos\b/i,
+      /ಪರವಾನಗಿ|ನೋಂದಣಿ|ಲೈಸೆನ್ಸ್/,
+      /लाइसेंस|लाइसेन्स|पंजीकरण|रजिस्ट्रेशन/,
+    ],
+    label: {
+      en: "FSSAI registration and licence",
+      hi: "FSSAI पंजीकरण और लाइसेंस",
+      kn: "FSSAI ನೋಂದಣಿ ಮತ್ತು ಪರವಾನಗಿ",
+    },
+    definition: {
+      en: "Every food business in India needs an FSSAI registration or licence, and which one applies depends on annual turnover. Under the FSSAI order effective 1 April 2026: registration up to 1.5 crore rupees, State licence above 1.5 crore up to 50 crore, and Central licence above 50 crore.",
+      hi: "भारत में हर खाद्य कारोबार के लिए FSSAI पंजीकरण या लाइसेंस ज़रूरी है, और कौन-सा लागू होगा यह सालाना कारोबार पर निर्भर करता है। 1 अप्रैल 2026 से लागू FSSAI आदेश के अनुसार 1.5 करोड़ रुपये तक पंजीकरण, 1.5 करोड़ से 50 करोड़ तक राज्य लाइसेंस और 50 करोड़ से अधिक पर केंद्रीय लाइसेंस लगता है।",
+      kn: "ಭಾರತದಲ್ಲಿ ಪ್ರತಿ ಆಹಾರ ಉದ್ಯಮಕ್ಕೂ FSSAI ನೋಂದಣಿ ಅಥವಾ ಪರವಾನಗಿ ಬೇಕು; ಯಾವುದು ಬೇಕು ಎಂಬುದು ವಾರ್ಷಿಕ ವಹಿವಾಟನ್ನು ಅವಲಂಬಿಸಿದೆ. ಏಪ್ರಿಲ್ 1, 2026 ರಿಂದ ಜಾರಿಗೆ ಬಂದ FSSAI ಆದೇಶದ ಪ್ರಕಾರ 1.5 ಕೋಟಿ ರೂಪಾಯಿವರೆಗೆ ನೋಂದಣಿ, 1.5 ಕೋಟಿಯಿಂದ 50 ಕೋಟಿವರೆಗೆ ರಾಜ್ಯ ಪರವಾನಗಿ ಮತ್ತು 50 ಕೋಟಿ ಮೇಲ್ಪಟ್ಟು ಕೇಂದ್ರ ಪರವಾನಗಿ ಅಗತ್ಯ.",
+    },
+    works: {
+      en: "You apply on the FSSAI licensing portal (FoSCoS), choosing registration, State or Central licence according to turnover. The application needs the business details, the premises address and the food category, and the licence is issued by the State authority, or by FSSAI for a Central licence. The licence number must then appear on labels, menus and bills.",
+      hi: "आवेदन FSSAI के लाइसेंसिंग पोर्टल FoSCoS पर किया जाता है, जिसमें कारोबार के अनुसार पंजीकरण, राज्य या केंद्रीय लाइसेंस चुना जाता है। कारोबार का विवरण, परिसर का पता और खाद्य श्रेणी देनी होती है। राज्य लाइसेंस राज्य प्राधिकरण और केंद्रीय लाइसेंस FSSAI जारी करता है, और लाइसेंस संख्या लेबल, मेन्यू तथा बिल पर छपी होनी चाहिए।",
+      kn: "ಅರ್ಜಿಯನ್ನು FSSAI ನ ಲೈಸೆನ್ಸಿಂಗ್ ಪೋರ್ಟಲ್ (FoSCoS) ನಲ್ಲಿ ಸಲ್ಲಿಸಲಾಗುತ್ತದೆ; ವಹಿವಾಟಿನ ಆಧಾರದಲ್ಲಿ ನೋಂದಣಿ, ರಾಜ್ಯ ಅಥವಾ ಕೇಂದ್ರ ಪರವಾನಗಿ ಆಯ್ಕೆ ಮಾಡಲಾಗುತ್ತದೆ. ಉದ್ಯಮದ ವಿವರ, ಆವರಣದ ವಿಳಾಸ ಮತ್ತು ಆಹಾರ ವರ್ಗ ನೀಡಬೇಕು. ರಾಜ್ಯ ಪರವಾನಗಿಯನ್ನು ರಾಜ್ಯ ಪ್ರಾಧಿಕಾರ ಮತ್ತು ಕೇಂದ್ರ ಪರವಾನಗಿಯನ್ನು FSSAI ನೀಡುತ್ತದೆ. ಪರವಾನಗಿ ಸಂಖ್ಯೆ ಲೇಬಲ್, ಮೆನು ಮತ್ತು ಬಿಲ್‌ನಲ್ಲಿ ಇರಬೇಕು.",
+    },
+    more: {
+      en: "The earlier turnover limits of 12 lakh and 20 crore rupees were superseded by that 2026 order, and licences already issued under the old limits stay valid.",
+      hi: "पुरानी सीमाएँ 12 लाख और 20 करोड़ रुपये 2026 के उस आदेश से बदल दी गई हैं, और पहले जारी किए गए लाइसेंस वैध बने रहते हैं।",
+      kn: "ಹಿಂದಿನ 12 ಲಕ್ಷ ಮತ್ತು 20 ಕೋಟಿ ರೂಪಾಯಿ ಮಿತಿಗಳನ್ನು 2026 ರ ಆದೇಶದಿಂದ ಬದಲಾಯಿಸಲಾಗಿದೆ; ಈಗಾಗಲೇ ನೀಡಲಾದ ಪರವಾನಗಿಗಳು ಮಾನ್ಯವಾಗಿ ಉಳಿಯುತ್ತವೆ.",
+    },
+  },
+  {
+    key: "complaint",
+    patterns: [
+      /\bcomplai(?:nt|nts|n)\b/i,
+      /\breport(?:ing)?\s+(?:an?\s+)?(?:issue|problem|shop|hotel|restaurant)\b/i,
+      /\bgrievance\b/i,
+      /ದೂರು/,
+      /शिकायत/,
+    ],
+    label: {
+      en: "filing a food safety complaint",
+      hi: "खाद्य सुरक्षा शिकायत दर्ज करना",
+      kn: "ಆಹಾರ ಸುರಕ್ಷತೆ ದೂರು ದಾಖಲಿಸುವುದು",
+    },
+    definition: {
+      en: "A food safety complaint can be filed with FSSAI or with your State food safety department when food is unsafe, substandard, misbranded, or sold in unhygienic conditions.",
+      hi: "जब भोजन असुरक्षित, घटिया, गलत लेबल वाला या अस्वच्छ परिस्थितियों में बेचा जा रहा हो, तब FSSAI या अपने राज्य के खाद्य सुरक्षा विभाग में शिकायत दर्ज की जा सकती है।",
+      kn: "ಆಹಾರ ಅಸುರಕ್ಷಿತ, ಕಳಪೆ ಗುಣಮಟ್ಟದ, ತಪ್ಪು ಲೇಬಲ್‌ನ ಅಥವಾ ಅನಾರೋಗ್ಯಕರ ಸ್ಥಿತಿಯಲ್ಲಿ ಮಾರಾಟವಾದಾಗ FSSAI ಅಥವಾ ನಿಮ್ಮ ರಾಜ್ಯದ ಆಹಾರ ಸುರಕ್ಷತಾ ಇಲಾಖೆಗೆ ದೂರು ನೀಡಬಹುದು.",
+    },
+    works: {
+      en: "You can file it on the FSSAI Food Safety Connect portal or app, email complaints@fssai.gov.in, or call the FSSAI helpline 1800-112-100. Give the outlet name and address, what was wrong, the date and time, and attach photos or the bill if you have them. The State food safety officer then inspects the premises and may lift a sample for testing.",
+      hi: "आप FSSAI के Food Safety Connect पोर्टल या ऐप पर, complaints@fssai.gov.in पर ईमेल करके, या FSSAI हेल्पलाइन 1800-112-100 पर कॉल करके शिकायत दर्ज कर सकते हैं। दुकान का नाम और पता, क्या गड़बड़ थी, तारीख और समय बताएँ, और फोटो या बिल संलग्न करें। इसके बाद राज्य का खाद्य सुरक्षा अधिकारी जाँच करता है और नमूना ले सकता है।",
+      kn: "FSSAI ನ Food Safety Connect ಪೋರ್ಟಲ್ ಅಥವಾ ಆ್ಯಪ್‌ನಲ್ಲಿ, complaints@fssai.gov.in ಗೆ ಇಮೇಲ್ ಮೂಲಕ, ಅಥವಾ FSSAI ಸಹಾಯವಾಣಿ 1800-112-100 ಗೆ ಕರೆ ಮಾಡಿ ದೂರು ನೀಡಬಹುದು. ಅಂಗಡಿಯ ಹೆಸರು ಮತ್ತು ವಿಳಾಸ, ಏನು ತಪ್ಪಾಗಿತ್ತು, ದಿನಾಂಕ ಮತ್ತು ಸಮಯ ತಿಳಿಸಿ; ಫೋಟೋ ಅಥವಾ ಬಿಲ್ ಲಗತ್ತಿಸಿ. ನಂತರ ರಾಜ್ಯ ಆಹಾರ ಸುರಕ್ಷತಾ ಅಧಿಕಾರಿ ತಪಾಸಣೆ ಮಾಡಿ ಮಾದರಿ ಸಂಗ್ರಹಿಸಬಹುದು.",
+    },
+    more: {
+      en: "Keep the bill, the food sample or photographs, and any medical record if you fell ill - they make the case much stronger. On this helpline you can simply describe the incident and a complaint draft is prepared for you.",
+      hi: "बिल, भोजन का नमूना या फोटो, और बीमार पड़ने पर मेडिकल रिकॉर्ड संभालकर रखें - इससे शिकायत मज़बूत होती है। इस हेल्पलाइन पर आप घटना बता सकते हैं और आपके लिए शिकायत का ड्राफ्ट तैयार हो जाता है।",
+      kn: "ಬಿಲ್, ಆಹಾರದ ಮಾದರಿ ಅಥವಾ ಫೋಟೋ, ಮತ್ತು ಅಸ್ವಸ್ಥಗೊಂಡಿದ್ದರೆ ವೈದ್ಯಕೀಯ ದಾಖಲೆ ಇಟ್ಟುಕೊಳ್ಳಿ - ಅವು ದೂರನ್ನು ಬಲಪಡಿಸುತ್ತವೆ. ಈ ಸಹಾಯವಾಣಿಯಲ್ಲಿ ಘಟನೆಯನ್ನು ವಿವರಿಸಿದರೆ ದೂರಿನ ಕರಡು ಸಿದ್ಧವಾಗುತ್ತದೆ.",
+    },
+  },
+  {
+    key: "hygiene",
+    patterns: [
+      /\bhygien\w*/i,
+      /\bsanit\w*/i,
+      /\bunclean\b/i,
+      /ನೈರ್ಮಲ್ಯ|ಸ್ವಚ್ಛತೆ|ಪರಿಶುದ್ಧ/,
+      /स्वच्छता|सफाई|हाइजीन|साफ-सफाई/,
+    ],
+    label: {
+      en: "FSSAI hygiene requirements",
+      hi: "FSSAI स्वच्छता नियम",
+      kn: "FSSAI ನೈರ್ಮಲ್ಯ ನಿಯಮಗಳು",
+    },
+    definition: {
+      en: "FSSAI's hygiene requirements are set out in Schedule 4 of the Licensing and Registration Regulations. They cover the premises, water quality, pest control, staff health and personal hygiene, and temperature control for food businesses.",
+      hi: "FSSAI के स्वच्छता नियम लाइसेंसिंग और पंजीकरण विनियमों की अनुसूची 4 में दिए गए हैं। इनमें परिसर, पानी की गुणवत्ता, कीट नियंत्रण, कर्मचारियों का स्वास्थ्य और व्यक्तिगत स्वच्छता तथा तापमान नियंत्रण शामिल हैं।",
+      kn: "FSSAI ನ ನೈರ್ಮಲ್ಯ ಅಗತ್ಯಗಳು ಲೈಸೆನ್ಸಿಂಗ್ ಮತ್ತು ನೋಂದಣಿ ನಿಯಮಾವಳಿಗಳ ಪರಿಶಿಷ್ಟ 4 ರಲ್ಲಿ ಇವೆ. ಅವು ಆವರಣ, ನೀರಿನ ಗುಣಮಟ್ಟ, ಕೀಟ ನಿಯಂತ್ರಣ, ಸಿಬ್ಬಂದಿಯ ಆರೋಗ್ಯ ಮತ್ತು ವೈಯಕ್ತಿಕ ನೈರ್ಮಲ್ಯ ಹಾಗೂ ತಾಪಮಾನ ನಿಯಂತ್ರಣವನ್ನು ಒಳಗೊಳ್ಳುತ್ತವೆ.",
+    },
+    works: {
+      en: "A food business has to keep the kitchen and stores clean and pest-free, use safe potable water, keep raw and cooked food separate, hold food at the correct temperature, and make sure staff are healthy, clean and trained. Food handlers are also required to be medically examined and trained.",
+      hi: "खाद्य कारोबार को रसोई और भंडार साफ तथा कीट-मुक्त रखना होता है, सुरक्षित पेयजल का उपयोग करना होता है, कच्चा और पका भोजन अलग रखना होता है, भोजन सही तापमान पर रखना होता है और कर्मचारियों का स्वस्थ, साफ तथा प्रशिक्षित होना ज़रूरी है। भोजन संभालने वालों की मेडिकल जाँच और ट्रेनिंग भी अनिवार्य है।",
+      kn: "ಆಹಾರ ಉದ್ಯಮವು ಅಡುಗೆಮನೆ ಮತ್ತು ಉಗ್ರಾಣವನ್ನು ಸ್ವಚ್ಛ ಹಾಗೂ ಕೀಟಮುಕ್ತವಾಗಿ ಇಡಬೇಕು, ಸುರಕ್ಷಿತ ಕುಡಿಯುವ ನೀರು ಬಳಸಬೇಕು, ಹಸಿ ಮತ್ತು ಬೇಯಿಸಿದ ಆಹಾರವನ್ನು ಪ್ರತ್ಯೇಕವಾಗಿ ಇಡಬೇಕು, ಸರಿಯಾದ ತಾಪಮಾನದಲ್ಲಿ ಆಹಾರ ಸಂಗ್ರಹಿಸಬೇಕು ಮತ್ತು ಸಿಬ್ಬಂದಿ ಆರೋಗ್ಯವಂತರಾಗಿ, ಸ್ವಚ್ಛವಾಗಿ ಹಾಗೂ ತರಬೇತಿ ಪಡೆದಿರಬೇಕು. ಆಹಾರ ನಿರ್ವಹಿಸುವವರ ವೈದ್ಯಕೀಯ ಪರೀಕ್ಷೆ ಮತ್ತು ತರಬೇತಿ ಕಡ್ಡಾಯ.",
+    },
+    more: {
+      en: "The State food safety officer inspects against these requirements, and serious failures can lead to an improvement notice, a fine, or suspension of the licence.",
+      hi: "राज्य का खाद्य सुरक्षा अधिकारी इन नियमों के आधार पर जाँच करता है, और गंभीर लापरवाही पर सुधार नोटिस, जुर्माना या लाइसेंस निलंबन हो सकता है।",
+      kn: "ಈ ಅಗತ್ಯಗಳ ಆಧಾರದಲ್ಲಿ ರಾಜ್ಯ ಆಹಾರ ಸುರಕ್ಷತಾ ಅಧಿಕಾರಿ ತಪಾಸಣೆ ಮಾಡುತ್ತಾರೆ; ಗಂಭೀರ ಲೋಪವಾದರೆ ಸುಧಾರಣಾ ನೋಟಿಸ್, ದಂಡ ಅಥವಾ ಪರವಾನಗಿ ಅಮಾನತು ಆಗಬಹುದು.",
+    },
+  },
+  {
+    key: "penalty",
+    patterns: [
+      /\bpenalt\w*/i,
+      /\bfine[sd]?\b/i,
+      /\bpunish\w*/i,
+      /\bprosecut\w*/i,
+      /\baction against\b/i,
+      /ದಂಡ|ಶಿಕ್ಷೆ|ಕ್ರಮ/,
+      /जुर्माना|सज़ा|सजा|कार्रवाई/,
+    ],
+    label: {
+      en: "penalties under the Food Safety and Standards Act",
+      hi: "खाद्य सुरक्षा और मानक अधिनियम के तहत दंड",
+      kn: "ಆಹಾರ ಸುರಕ್ಷತೆ ಮತ್ತು ಗುಣಮಟ್ಟ ಕಾಯ್ದೆಯಡಿ ದಂಡ",
+    },
+    definition: {
+      en: "Under the Food Safety and Standards Act, 2006, the penalty depends on how serious the violation is. Substandard food, misbranded food and unsafe food are treated as separate categories, and both the fine and the possible prison term rise with the category and with repeat offences.",
+      hi: "खाद्य सुरक्षा और मानक अधिनियम, 2006 के तहत दंड इस पर निर्भर करता है कि उल्लंघन कितना गंभीर है। घटिया भोजन, गलत लेबल वाला भोजन और असुरक्षित भोजन अलग-अलग श्रेणियाँ हैं, और श्रेणी तथा बार-बार उल्लंघन के साथ जुर्माना व कारावास बढ़ता है।",
+      kn: "ಆಹಾರ ಸುರಕ್ಷತೆ ಮತ್ತು ಗುಣಮಟ್ಟ ಕಾಯ್ದೆ, 2006 ರ ಅಡಿಯಲ್ಲಿ ದಂಡವು ಉಲ್ಲಂಘನೆಯ ತೀವ್ರತೆಯನ್ನು ಅವಲಂಬಿಸಿದೆ. ಕಳಪೆ ಆಹಾರ, ತಪ್ಪು ಲೇಬಲ್‌ನ ಆಹಾರ ಮತ್ತು ಅಸುರಕ್ಷಿತ ಆಹಾರ ಪ್ರತ್ಯೇಕ ವರ್ಗಗಳು; ವರ್ಗ ಮತ್ತು ಪುನರಾವರ್ತಿತ ಉಲ್ಲಂಘನೆಗೆ ಅನುಗುಣವಾಗಿ ದಂಡ ಹಾಗೂ ಜೈಲು ಶಿಕ್ಷೆ ಹೆಚ್ಚಾಗುತ್ತದೆ.",
+    },
+    works: {
+      en: "Enforcement usually starts with an inspection and a sample test. The officer can issue an improvement notice, order a recall of the food, fine the business, or prosecute in court, and an Adjudicating Officer decides the penalty in that case.",
+      hi: "कार्रवाई सामान्यतः निरीक्षण और नमूना जाँच से शुरू होती है। अधिकारी सुधार नोटिस दे सकता है, भोजन वापस मंगाने का आदेश दे सकता है, जुर्माना लगा सकता है या अदालत में मुकदमा चला सकता है, और उस मामले में दंड अधिनिर्णायक अधिकारी तय करता है।",
+      kn: "ಕ್ರಮ ಸಾಮಾನ್ಯವಾಗಿ ತಪಾಸಣೆ ಮತ್ತು ಮಾದರಿ ಪರೀಕ್ಷೆಯಿಂದ ಆರಂಭವಾಗುತ್ತದೆ. ಅಧಿಕಾರಿ ಸುಧಾರಣಾ ನೋಟಿಸ್ ನೀಡಬಹುದು, ಆಹಾರ ಮರುಪಡೆಯುವ ಆದೇಶಿಸಬಹುದು, ದಂಡ ವಿಧಿಸಬಹುದು ಅಥವಾ ನ್ಯಾಯಾಲಯದಲ್ಲಿ ಮೊಕದ್ದಮೆ ಹೂಡಬಹುದು; ಆ ಪ್ರಕರಣದ ದಂಡವನ್ನು ನ್ಯಾಯನಿರ್ಣಾಯಕ ಅಧಿಕಾರಿ ನಿರ್ಧರಿಸುತ್ತಾರೆ.",
+    },
+    more: {
+      en: "A business can appeal against an order, and a consumer can separately claim compensation for harm caused by unsafe food.",
+      hi: "कारोबार आदेश के विरुद्ध अपील कर सकता है, और उपभोक्ता असुरक्षित भोजन से हुई हानि के लिए अलग से मुआवज़ा माँग सकता है।",
+      kn: "ಉದ್ಯಮವು ಆದೇಶದ ವಿರುದ್ಧ ಮೇಲ್ಮನವಿ ಸಲ್ಲಿಸಬಹುದು; ಅಸುರಕ್ಷಿತ ಆಹಾರದಿಂದಾದ ಹಾನಿಗೆ ಗ್ರಾಹಕರು ಪ್ರತ್ಯೇಕವಾಗಿ ಪರಿಹಾರ ಕೋರಬಹುದು.",
+    },
+  },
+  {
+    key: "packaged",
+    patterns: [
+      /\bpackaged?\s+food\b/i,
+      /\blabel(?:l?ing)?\b/i,
+      /\bbest before\b/i,
+      /\bexpiry\b/i,
+      /\bingredients?\b/i,
+      /ಪ್ಯಾಕೇಜ್|ಲೇಬಲ್|ಅವಧಿ|ಪದಾರ್ಥ/,
+      /पैकेज|लेबल|एक्सपायरी|समाप्ति|सामग्री/,
+    ],
+    label: {
+      en: "FSSAI labelling rules for packaged food",
+      hi: "पैकेज्ड भोजन के लिए FSSAI लेबलिंग नियम",
+      kn: "ಪ್ಯಾಕೇಜ್ ಆಹಾರದ FSSAI ಲೇಬಲಿಂಗ್ ನಿಯಮ",
+    },
+    definition: {
+      en: "Packaged food sold in India has to carry the FSSAI licence number and logo, the ingredient list, nutrition information, the veg or non-veg mark, the net quantity, and a best-before or expiry date.",
+      hi: "भारत में बिकने वाले पैकेज्ड भोजन पर FSSAI लाइसेंस संख्या और लोगो, सामग्री की सूची, पोषण जानकारी, शाकाहारी या मांसाहारी चिह्न, शुद्ध मात्रा तथा बेस्ट बिफोर या एक्सपायरी तारीख होनी चाहिए।",
+      kn: "ಭಾರತದಲ್ಲಿ ಮಾರಾಟವಾಗುವ ಪ್ಯಾಕೇಜ್ ಆಹಾರದಲ್ಲಿ FSSAI ಪರವಾನಗಿ ಸಂಖ್ಯೆ ಮತ್ತು ಲೋಗೋ, ಪದಾರ್ಥಗಳ ಪಟ್ಟಿ, ಪೋಷಕಾಂಶ ಮಾಹಿತಿ, ಸಸ್ಯಾಹಾರಿ ಅಥವಾ ಮಾಂಸಾಹಾರಿ ಚಿಹ್ನೆ, ನಿವ್ವಳ ಪ್ರಮಾಣ ಮತ್ತು ಅವಧಿ ಮುಗಿಯುವ ದಿನಾಂಕ ಇರಬೇಕು.",
+    },
+    works: {
+      en: "The label is checked in two ways: the licence number and logo show the business is registered, and the ingredient and nutrition panel shows what is actually in the pack. A pack without a licence number, or with a false claim, is misbranded and can be complained about.",
+      hi: "लेबल दो तरह से जाँचा जाता है: लाइसेंस संख्या और लोगो बताते हैं कि कारोबार पंजीकृत है, और सामग्री तथा पोषण पैनल बताता है कि पैक में वास्तव में क्या है। लाइसेंस संख्या के बिना या झूठे दावे वाला पैक गलत लेबल वाला माना जाता है और उसकी शिकायत की जा सकती है।",
+      kn: "ಲೇಬಲ್ ಅನ್ನು ಎರಡು ರೀತಿಯಲ್ಲಿ ಪರಿಶೀಲಿಸಲಾಗುತ್ತದೆ: ಪರವಾನಗಿ ಸಂಖ್ಯೆ ಮತ್ತು ಲೋಗೋ ಉದ್ಯಮ ನೋಂದಾಯಿತವಾಗಿದೆ ಎಂದು ತೋರಿಸುತ್ತವೆ, ಮತ್ತು ಪದಾರ್ಥ ಹಾಗೂ ಪೋಷಕಾಂಶ ಪಟ್ಟಿ ಪ್ಯಾಕ್‌ನಲ್ಲಿ ಏನಿದೆ ಎಂದು ತಿಳಿಸುತ್ತವೆ. ಪರವಾನಗಿ ಸಂಖ್ಯೆ ಇಲ್ಲದ ಅಥವಾ ಸುಳ್ಳು ಪ್ರತಿಪಾದನೆಯ ಪ್ಯಾಕ್ ತಪ್ಪು ಲೇಬಲ್ ಎನಿಸುತ್ತದೆ ಮತ್ತು ದೂರು ನೀಡಬಹುದು.",
+    },
+    more: {
+      en: "Keep the pack and the bill - a misbranding complaint needs the label itself as evidence.",
+      hi: "पैक और बिल संभालकर रखें - गलत लेबलिंग की शिकायत में लेबल ही सबूत होता है।",
+      kn: "ಪ್ಯಾಕ್ ಮತ್ತು ಬಿಲ್ ಇಟ್ಟುಕೊಳ್ಳಿ - ತಪ್ಪು ಲೇಬಲಿಂಗ್ ದೂರಿಗೆ ಲೇಬಲ್ ಕೂಡ ಸಾಕ್ಷ್ಯವಾಗುತ್ತದೆ.",
+    },
+  },
+  {
+    key: "app",
+    patterns: [
+      /\b(?:this|your|the)\s+(?:app|application|website|chatbot|bot|assistant|system|software)\b/i,
+      /\bhow\s+do\s+(?:you|u)\s+work\b/i,
+      /\bwhat\s+can\s+you\s+do\b/i,
+      /\bwho\s+are\s+you\b/i,
+      /ಈ\s*ಆ್ಯಪ್|ನೀವು\s*ಹೇಗೆ\s*ಕೆಲಸ|ನೀವು\s*ಯಾರು/,
+      /यह\s*ऐप|इस\s*ऐप|आप\s*कैसे\s*काम|आप\s*कौन/,
+    ],
+    label: {
+      en: "this Food Safety Assistant helpline",
+      hi: "यह खाद्य सुरक्षा सहायक हेल्पलाइन",
+      kn: "ಈ ಆಹಾರ ಸುರಕ್ಷತಾ ಸಹಾಯಕ ಸಹಾಯವಾಣಿ",
+    },
+    definition: {
+      en: "This is the Food Safety Assistant - a voice and text helpline where you can ask food safety questions or report a problem. It records the details you describe and can prepare a complaint for you.",
+      hi: "यह खाद्य सुरक्षा सहायक है - एक वॉइस और टेक्स्ट हेल्पलाइन जहाँ आप खाद्य सुरक्षा संबंधी प्रश्न पूछ सकते हैं या समस्या बता सकते हैं। यह आपके बताए विवरण दर्ज करता है और आपके लिए शिकायत तैयार कर सकता है।",
+      kn: "ಇದು ಆಹಾರ ಸುರಕ್ಷತಾ ಸಹಾಯಕ - ಧ್ವನಿ ಮತ್ತು ಪಠ್ಯ ಸಹಾಯವಾಣಿ. ಇಲ್ಲಿ ಆಹಾರ ಸುರಕ್ಷತೆ ಬಗ್ಗೆ ಪ್ರಶ್ನೆ ಕೇಳಬಹುದು ಅಥವಾ ಸಮಸ್ಯೆ ತಿಳಿಸಬಹುದು. ನೀವು ಹೇಳುವ ವಿವರಗಳನ್ನು ದಾಖಲಿಸಿ, ದೂರನ್ನು ಸಿದ್ಧಪಡಿಸುತ್ತದೆ.",
+    },
+    works: {
+      en: "You can speak or type. It answers food safety questions from its stored reference material, remembers the details and the subject of your conversation, and when you describe an incident it prepares a complaint and submits it once you confirm.",
+      hi: "आप बोल सकते हैं या लिख सकते हैं। यह अपनी संग्रहीत सामग्री से खाद्य सुरक्षा के प्रश्नों का उत्तर देता है, आपके विवरण और बातचीत का विषय याद रखता है, और घटना बताने पर शिकायत तैयार करके आपकी पुष्टि पर दर्ज करता है।",
+      kn: "ನೀವು ಮಾತನಾಡಬಹುದು ಅಥವಾ ಬರೆಯಬಹುದು. ಸಂಗ್ರಹಿಸಿದ ಮಾಹಿತಿಯಿಂದ ಆಹಾರ ಸುರಕ್ಷತೆ ಪ್ರಶ್ನೆಗಳಿಗೆ ಉತ್ತರಿಸುತ್ತದೆ, ನಿಮ್ಮ ವಿವರ ಮತ್ತು ಸಂಭಾಷಣೆಯ ವಿಷಯವನ್ನು ನೆನಪಿಟ್ಟುಕೊಳ್ಳುತ್ತದೆ, ಘಟನೆ ತಿಳಿಸಿದಾಗ ದೂರು ಸಿದ್ಧಪಡಿಸಿ ನೀವು ದೃಢೀಕರಿಸಿದ ಮೇಲೆ ಸಲ್ಲಿಸುತ್ತದೆ.",
+    },
+    more: {
+      en: "The New conversation button starts a fresh thread; your earlier conversation and its topics stay saved on this device and are never mixed with another caller's.",
+      hi: "नई बातचीत बटन नया थ्रेड शुरू करता है; आपकी पिछली बातचीत और उसके विषय इसी डिवाइस पर सुरक्षित रहते हैं और किसी अन्य व्यक्ति से नहीं मिलाए जाते।",
+      kn: "ಹೊಸ ಸಂಭಾಷಣೆ ಬಟನ್ ಹೊಸ ಥ್ರೆಡ್ ಆರಂಭಿಸುತ್ತದೆ; ನಿಮ್ಮ ಹಿಂದಿನ ಸಂಭಾಷಣೆ ಮತ್ತು ವಿಷಯಗಳು ಈ ಸಾಧನದಲ್ಲಿ ಉಳಿಯುತ್ತವೆ ಮತ್ತು ಬೇರೆಯವರೊಂದಿಗೆ ಬೆರೆಯುವುದಿಲ್ಲ.",
+    },
+  },
+];
+
+const TOPIC_BY_KEY: Record<string, TopicEntry> = TOPIC_LIBRARY.reduce((acc, entry) => {
+  acc[entry.key] = entry;
+  return acc;
+}, {} as Record<string, TopicEntry>);
+
+/**
+ * Every known topic the text mentions, ordered by WHERE it appears (not by
+ * library order), so "how does the FSSAI licence work" resolves to licences.
+ */
+function detectTopics(text: string): TopicKey[] {
+  const t = String(text || "");
+  if (!t.trim()) return [];
+  const hits: Array<{ key: TopicKey; at: number }> = [];
+  for (const entry of TOPIC_LIBRARY) {
+    let best = -1;
+    for (const re of entry.patterns) {
+      const m = re.exec(t);
+      if (m && (best === -1 || m.index < best)) best = m.index;
+    }
+    if (best >= 0) hits.push({ key: entry.key, at: best });
+  }
+  return hits.sort((a, b) => a.at - b.at).map((h) => h.key);
+}
+
+/** A topic list as stored (server) or sent by the browser. Unknown values dropped. */
+function normalizeTopicList(value: any): TopicKey[] {
+  if (!Array.isArray(value)) return [];
+  const out: TopicKey[] = [];
+  for (const raw of value.slice(-12)) {
+    const key = String(raw || "").toLowerCase();
+    if (TOPIC_BY_KEY[key] && !out.includes(key as TopicKey)) out.push(key as TopicKey);
+  }
+  return out;
+}
+
+/**
+ * What the conversation is about right now.
+ *
+ * The CURRENT topic is the last one mentioned, not the most frequent one - that
+ * is how people actually talk ("what is FSSAI?" ... "how does it work?"). When
+ * the server has no turns at all (restart, serverless instance) the browser's own
+ * topic list is used instead, so memory survives even without a database.
+ */
+function deriveTopicState(turns: ConversationTurn[], clientTopics: TopicKey[] = []) {
+  const sequence: TopicKey[] = [];
+  for (const turn of turns) {
+    if (turn.role !== "user") continue;
+    for (const key of detectTopics(turn.text)) sequence.push(key);
+  }
+  if (!sequence.length && clientTopics.length) sequence.push(...clientTopics);
+
+  const current = sequence.length ? sequence[sequence.length - 1] : null;
+
+  const mentioned: TopicKey[] = [];
+  for (let i = sequence.length - 1; i >= 0; i--) {
+    if (!mentioned.includes(sequence[i])) mentioned.push(sequence[i]);
+  }
+  return { sequence, current, mentioned: mentioned.slice(0, 6) };
+}
+
+/** A pronominal follow-up: "how does it work", "why?", "tell me more". */
+const FOLLOW_UP_HOW = [
+  /\bhow\s+(?:does|do|did)\s+(?:it|that|this|they|these)\b/i,
+  /\bhow\s+(?:it|that|this)\s+works?\b/i,
+  /^\s*(?:and\s+)?how\s+(?:does\s+)?(?:it|that|this)?\s*works?\s*[?.!]*$/i,
+  /(?:ಅದು|ಇದು|ಅವು)\s*ಹೇಗೆ/,
+  /ಹೇಗೆ\s*ಕೆಲಸ\s*ಮಾಡುತ್ತದೆ/,
+  /(?:यह|ये|वो|वह|इसका|उसका)\s*कैसे/,
+  /कैसे\s*काम\s*करता/,
+];
+
+const FOLLOW_UP_MORE = [
+  /^\s*(?:please\s+)?(?:tell me more|more|explain|explain more|go on|continue|elaborate|details)\s*[?.!]*$/i,
+  /^\s*(?:why|how so|and)\s*[?.!]*$/i,
+  /(?:ಇನ್ನಷ್ಟು|ಮತ್ತಷ್ಟು|ವಿವರವಾಗಿ|ವಿವರಿಸಿ)/,
+  /(?:और\s*बताओ|और\s*बताइए|विस्तार|आगे\s*बताओ)/,
+];
+
+function resolveFollowUpIntent(text: string): "how" | "more" | null {
+  const t = String(text || "").trim();
+  if (!t) return null;
+  if (FOLLOW_UP_HOW.some((re) => re.test(t))) return "how";
+  if (FOLLOW_UP_MORE.some((re) => re.test(t))) return "more";
+  return null;
+}
+
+// No \b around the Devanagari/Kannada alternatives: JavaScript word boundaries
+// are ASCII-only, so they never match next to those scripts.
+const DEFINITION_QUESTION = /^\s*(?:what\s+is|what's|whats|define|tell\s+me\s+about)\b|क्या\s*है|ಎಂದರೆ\s*ಏನು/i;
+
+function isDefinitionQuestion(text: string): boolean {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  if (DEFINITION_QUESTION.test(t)) return true;
+  return /ಎಂದರೆ\s*ಏನು|ಏನು\s*ಎಂದರೆ/.test(t);
+}
+
+const HOW_QUESTION = /\bhow\s+(?:does|do|did|is|are|can|to)\b|\bhow\b[^.?!]*\b(?:work|works|working|function)\b|ಹೇಗೆ|कैसे/i;
+
+function isHowQuestion(text: string): boolean {
+  return HOW_QUESTION.test(String(text || ""));
+}
+
+/**
+ * Questions that need a specific figure or procedure ("what is the licence fee?")
+ * are NOT answered from the short reference text - the model gets the reference
+ * and answers properly instead of this library returning a near-miss definition.
+ */
+const DETAIL_ASKING = /\b(?:fee|fees|cost|price|charges?|documents?|renew|renewal|apply|application|eligib\w*|process|timeline|how\s+long|validity|amount|section|number)\b/i;
+
+/** Words that mean the caller is reporting an incident, not asking a FAQ. */
+const INCIDENT_DETAIL_PATTERN = /(worm|insect|hair\s+in|dead\s+(?:insect|cockroach|fly)|stale|spoiled|rotten|contaminated|food\s+poisoning|vomiting|stomach\s+(?:ache|pain)|foul\s+smell|unhygienic|dirty|ಹುಳು|ಕೂದಲು|ಹಳಸಿದ|ವಾಂತಿ|ಹೊಟ್ಟೆ\s*ನೋವು|ಕೊಳಕು|कीड़ा|बाल|बासी|उल्टी|पेट\s*दर्द|गंदा|बदबू)/i;
+
+/**
+ * Answer a topic question from the stored reference instead of letting the model
+ * resolve a pronoun by itself. Returns null when the turn is not a topic FAQ, so
+ * the normal (model-driven) path still handles everything else.
+ */
+function resolveGroundedTopicAnswer(
+  queryText: string,
+  explicitTopics: TopicKey[],
+  currentTopic: TopicKey | null,
+  followUp: "how" | "more" | null,
+  langName: string
+): { text: string; topic: TopicKey } | null {
+  if (!queryText.trim()) return null;
+  if (INCIDENT_DETAIL_PATTERN.test(queryText)) return null;  // a live complaint
+  if (DETAIL_ASKING.test(queryText)) return null;            // needs a real answer, not a definition
+
+  const named = explicitTopics[0] || null;
+  const target = named || currentTopic;
+  if (!target) return null;
+
+  const entry = TOPIC_BY_KEY[target];
+  if (!entry) return null;
+
+  const lang = toLangCode(langName);
+
+  if (named && isDefinitionQuestion(queryText)) return { text: entry.definition[lang], topic: target };
+  if (named && isHowQuestion(queryText)) return { text: entry.works[lang], topic: target };
+  if (!named && followUp === "how") return { text: entry.works[lang], topic: target };
+  if (!named && followUp === "more") return { text: entry.more[lang], topic: target };
+
+  return null;
+}
+
+/**
+ * The prompt block that makes the topic explicit. Without this the model treats a
+ * pronoun follow-up as a question about itself - the exact defect reported.
+ */
+function buildTopicBlock(topics: TopicKey[], current: TopicKey | null, langName: string): string {
+  const lang = toLangCode(langName);
+
+  if (!current) {
+    return [
+      "=== CURRENT TOPIC ===",
+      "Nothing has been discussed yet, so no topic is established.",
+      'If the caller uses a bare pronoun ("how does it work?", "why?") without naming a subject, ask what they are referring to instead of guessing.',
+    ].join("\n");
+  }
+
+  const entry = TOPIC_BY_KEY[current];
+  if (!entry) return "";
+
+  const earlier = topics
+    .filter((t) => t !== current && TOPIC_BY_KEY[t])
+    .map((t) => TOPIC_BY_KEY[t].label.en);
+
+  return [
+    '=== CURRENT TOPIC (this is what "it" / "that" refers to) ===',
+    `Current topic: ${entry.label[lang]}`,
+    earlier.length ? `Earlier topics in this conversation, most recent first: ${earlier.join("; ")}` : "",
+    `Reference you may use (do not contradict it): ${entry.definition[lang]} ${entry.works[lang]}`,
+    "RULES:",
+    '- A follow-up such as "how does it work", "why", "tell me more", "and?" refers to the CURRENT TOPIC above. Answer about THAT subject.',
+    "- Never describe how this app, website, chatbot or helpline works unless the caller explicitly asks about the app itself. Explaining yourself when they asked about a food safety subject is a wrong answer.",
+    "- If the caller moves to a new subject, that new subject becomes the current topic.",
+  ].filter(Boolean).join("\n");
+}
+
 // Start a fresh conversation: close the caller's previous thread so it is no
 // longer picked up as their "latest" open conversation.
 app.post("/api/chat/new", chatLimit, async (req, res) => {
@@ -1722,6 +2178,13 @@ app.post("/api/chat", chatLimit, async (req, res) => {
   conversation.language = langName;
   if (profile) conversation.profile = profile;
 
+  // --- Topic memory -------------------------------------------------------
+  // What is this conversation about? Derived from every stored turn, with the
+  // browser's own topic list as a fallback for a restarted / serverless instance.
+  const topicState = deriveTopicState(conversation.turns, normalizeTopicList(req.body?.clientTopics));
+  const currentTopic = topicState.current;
+  conversation.topics = topicState.mentioned;
+
   // Answer "what did I say?" from the stored transcript instead of letting the
   // model guess - a small model reliably replied "I don't know" here.
   if (wantsRecall(queryText)) {
@@ -1742,6 +2205,41 @@ app.post("/api/chat", chatLimit, async (req, res) => {
       isComplaintDraft: false,
       conversationId,
       recalled: true,
+      cached: false,
+      topic: currentTopic,
+      topics: conversation.topics,
+    });
+  }
+
+  // --- Grounded topic answers ---------------------------------------------
+  // "How does it work?" has no antecedent of its own, so it is resolved from the
+  // CURRENT TOPIC and answered from the gathered reference text. This is what
+  // stops the assistant answering a question about FSSAI by explaining the app.
+  const explicitTopics = detectTopics(queryText);
+  const followUpIntent = resolveFollowUpIntent(queryText);
+  const grounded = resolveGroundedTopicAnswer(queryText, explicitTopics, currentTopic, followUpIntent, langName);
+
+  if (grounded) {
+    conversation.turns.push({ role: "assistant", text: grounded.text, at: Date.now() });
+    await saveConversation(conversation);
+    let audioUrl: string | null = null;
+    try {
+      audioUrl = await generateTTSAudioUrl(grounded.text, langName);
+    } catch {
+      audioUrl = null;
+    }
+    console.log(`[/api/chat] Answered from topic memory: ${grounded.topic}`);
+    return res.json({
+      response: grounded.text,
+      spokenText: grounded.text,
+      markdownReport: "",
+      audioUrl,
+      isComplaintDraft: false,
+      conversationId,
+      recalled: false,
+      grounded: true,
+      topic: grounded.topic,
+      topics: conversation.topics,
       cached: false,
     });
   }
@@ -1792,6 +2290,10 @@ app.post("/api/chat", chatLimit, async (req, res) => {
       : '',
   ].filter(Boolean).join('\n\n');
 
+  // The subject under discussion, stated explicitly. Without this the model
+  // resolves "it" to itself and explains the app instead of answering.
+  const topicBlock = buildTopicBlock(conversation.topics as TopicKey[], currentTopic, langName);
+
   try {
     let effectiveContext = context || "";
 
@@ -1836,6 +2338,8 @@ CORE BEHAVIOR INSTRUCTIONS:
 
 3. INFORMATIONAL INQUIRIES & CHIT-CHAT:
    - Answer directly, accurately, and conversationally in 1-2 concise sentences without repeating greetings.
+   - Answer about the CURRENT TOPIC below. A question like "how does it work?" follows on from what you were just discussing - it does not mean "explain yourself".
+   - Never explain how this app, website, chatbot or helpline works unless the caller explicitly asks about the app. If they asked about FSSAI, licensing, hygiene, penalties or labelling, answer about THAT.
 
 4. GRIEVANCE / COMPLAINT REPORTING (Only when user reports a food safety issue):
    - Details already established from this conversation - Location: "${analysis.location || "unknown"}", When: "${analysis.when || "unknown"}", Cause: "${analysis.cause || "unknown"}", What they ate: "${analysis.item || "unknown"}".
@@ -1850,6 +2354,8 @@ CORE BEHAVIOR INSTRUCTIONS:
 
 === CONVERSATION MEMORY (this is what makes you sound like a person who was listening) ===
 ${memoryBlock}
+
+${topicBlock}
 
 === HONESTY ABOUT MEMORY (never break these) ===
 - The memory above is the ONLY thing you remember. There is no other history you can access.
@@ -1954,7 +2460,10 @@ Always respond warmly, naturally, and directly to what the user actually said.`;
       audioUrl, 
       isComplaintDraft, 
       conversationId,
-      cached: false 
+      cached: false,
+      // Sent back so the browser can keep its own topic memory in localStorage.
+      topic: currentTopic,
+      topics: conversation.topics,
     });
   } catch (error: any) {
     console.error("[Chat Error]:", error);

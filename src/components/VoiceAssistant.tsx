@@ -8,6 +8,70 @@ import { RenderedMarkdown } from './RenderedMarkdown';
 import { transcribeAudioInBrowser } from '../lib/clientWhisper';
 import { stripEmojis, cleanSpeechTranscript, mergeTranscripts, isAffirmation, collapseRepetitions, normalizeRecognizedText } from '../utils/text';
 
+// ---------------------------------------------------------------------------
+// Browser memory
+//
+// The server keeps the conversation, but the browser used to keep only the
+// conversation ID. So after a reload - or when a request lands on a different
+// server instance - the assistant had no idea what was being discussed, and a
+// follow-up like "how does it work?" came back as a description of the app.
+//
+// This stores the recent turns AND the subjects of the conversation in
+// localStorage, so the topic is known on this device even when the server has
+// nothing. It is per-browser, never shared, and cleared by "New conversation".
+// ---------------------------------------------------------------------------
+type BrowserMemoryTurn = { role: 'user' | 'assistant'; text: string; at: number };
+
+type BrowserMemory = {
+  conversationId: string;
+  /** Most recent first, e.g. ["fssai", "licence"]. */
+  topics: string[];
+  turns: BrowserMemoryTurn[];
+  updatedAt: number;
+};
+
+const BROWSER_MEMORY_KEY = 'vox_memory_v1';
+const BROWSER_MEMORY_MAX_TURNS = 24;
+
+function loadBrowserMemory(): BrowserMemory | null {
+  try {
+    const raw = localStorage.getItem(BROWSER_MEMORY_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return {
+      conversationId: typeof parsed.conversationId === 'string' ? parsed.conversationId : '',
+      topics: Array.isArray(parsed.topics) ? parsed.topics.filter((t: any) => typeof t === 'string').slice(-8) : [],
+      turns: Array.isArray(parsed.turns)
+        ? parsed.turns
+            .filter((t: any) => t && (t.role === 'user' || t.role === 'assistant') && typeof t.text === 'string')
+            .slice(-BROWSER_MEMORY_MAX_TURNS)
+        : [],
+      updatedAt: Number(parsed.updatedAt) || Date.now(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveBrowserMemory(memory: BrowserMemory): void {
+  try {
+    localStorage.setItem(BROWSER_MEMORY_KEY, JSON.stringify({
+      ...memory,
+      turns: memory.turns.slice(-BROWSER_MEMORY_MAX_TURNS),
+      updatedAt: Date.now(),
+    }));
+  } catch {
+    // Private mode / quota: the server copy still keeps the conversation.
+  }
+}
+
+function clearBrowserMemory(): void {
+  try {
+    localStorage.removeItem(BROWSER_MEMORY_KEY);
+  } catch {}
+}
+
 function isHallucinatedText(text: string): boolean {
   if (!text || !text.trim()) return true;
   // Reject CJK (Chinese, Japanese, Korean) or Cyrillic characters returned as hallucinations
@@ -98,6 +162,8 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
   // The server keys conversation memory on this id, so the assistant remembers
   // what was said even after a reload or a long conversation.
   const conversationIdRef = useRef<string>('');
+  // Subjects already discussed, mirrored from the server so a reload keeps them.
+  const topicsRef = useRef<string[]>([]);
 
   // High-performance response cache for repeated queries
   const queryCacheRef = useRef<Map<string, { response: string; spokenText: string; audioUrl?: string; isComplaintDraft?: boolean; markdownReport?: string }>>(new Map());
@@ -168,12 +234,55 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
   // Sending no id is what lets the server continue the caller's own thread on a
   // new device; sending an unknown id would look like a deliberate fresh start.
   useEffect(() => {
+    const storedMemory = loadBrowserMemory();
     try {
-      conversationIdRef.current = localStorage.getItem('vox_conversation_id') || '';
+      conversationIdRef.current =
+        storedMemory?.conversationId || localStorage.getItem('vox_conversation_id') || '';
     } catch {
-      conversationIdRef.current = '';
+      conversationIdRef.current = storedMemory?.conversationId || '';
+    }
+
+    if (storedMemory) {
+      topicsRef.current = storedMemory.topics;
+      // Restore what was on screen: the subject is only useful if the caller can
+      // see the conversation it came from.
+      if (storedMemory.turns.length) {
+        setMessages(storedMemory.turns.map((turn, index) => ({
+          id: `restored-${index}`,
+          text: turn.text,
+          sender: turn.role,
+          timestamp: turn.at,
+        })));
+      }
     }
   }, []);
+
+  /**
+   * Append a turn to browser memory. The topic list comes from the server, so the
+   * browser and the server agree on what the conversation is about.
+   */
+  const rememberTurn = (
+    role: 'user' | 'assistant',
+    text: string,
+    extra?: { topics?: string[]; conversationId?: string }
+  ) => {
+    if (!text || !text.trim()) return;
+    const existing = loadBrowserMemory();
+    const memory: BrowserMemory = existing || {
+      conversationId: '',
+      topics: [],
+      turns: [],
+      updatedAt: Date.now(),
+    };
+
+    memory.conversationId = extra?.conversationId || conversationIdRef.current || memory.conversationId;
+    memory.turns = [...memory.turns, { role, text: text.trim(), at: Date.now() }].slice(-BROWSER_MEMORY_MAX_TURNS);
+    if (extra?.topics && extra.topics.length) {
+      memory.topics = extra.topics.slice(-8);
+    }
+    topicsRef.current = memory.topics;
+    saveBrowserMemory(memory);
+  };
 
   // Release the orb visualiser microphone when the page goes away.
   useEffect(() => {
@@ -853,6 +962,10 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     } catch {}
 
     queryCacheRef.current.clear();
+    // A new conversation must not inherit the old subject, on the server or here.
+    // The id written above stays - it names the new, empty thread.
+    clearBrowserMemory();
+    topicsRef.current = [];
     setMessages([]);
     setTranscript('');
     transcriptRef.current = '';
@@ -981,6 +1094,9 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
       timestamp: Date.now() 
     };
     setMessages(prev => [...prev, userMsg]);
+    // Store the caller's words in browser memory immediately, so a reload mid-turn
+    // cannot lose the subject of the conversation.
+    rememberTurn('user', queryText);
     setIsLoading(true);
     isLoadingRef.current = true;
     setTranscript('');
@@ -1022,6 +1138,7 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
         audioUrl: cachedResponse.audioUrl
       };
       setMessages(prev => [...prev, assistantMsg]);
+      rememberTurn('assistant', assistantMsg.text);
       speak(cachedResponse.spokenText || cachedResponse.response, cachedResponse.audioUrl, assistantMsg.id);
       if (cachedResponse.isComplaintDraft) {
         setComplaintDraft({
@@ -1045,7 +1162,10 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
           language, 
           profile,
           chatCount: userTurnCount,
-          conversationId: conversationIdRef.current || undefined
+          conversationId: conversationIdRef.current || undefined,
+          // Browser-side topic memory: lets the server resolve a follow-up even
+          // when it has no stored turns (restart, or a different instance).
+          clientTopics: topicsRef.current
         })
       });
 
@@ -1094,6 +1214,12 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
       };
       
       setMessages(prev => [...prev, assistantMsg]);
+      // Mirror the server's topic ledger into the browser, so the subject of the
+      // conversation is still known here after a reload.
+      rememberTurn('assistant', assistantReply, {
+        topics: Array.isArray(data.topics) ? data.topics : undefined,
+        conversationId: conversationIdRef.current,
+      });
       speak(spokenVoiceText, data.audioUrl, assistantMsg.id);
 
       // Detect if AI suggested a complaint

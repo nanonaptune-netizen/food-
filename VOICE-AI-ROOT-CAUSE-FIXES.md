@@ -691,3 +691,122 @@ behaviour, not a bug.
 | `server.ts` | Broadened `RECALL_PATTERNS` + bare remember-question handling, `isSubstantiveUtterance`, rewritten `buildRecallReply`, memory honesty block driven by `hasAnyMemory`, `GET /api/health`, clearer missing-database startup warning |
 | `test-recall-intent.mjs` | New — 14-case recall-intent and honesty suite |
 | `test-memory-isolation.mjs` | Assertion updated to the new refusal wording |
+
+---
+
+# Round 7 — "I asked about FSSAI, then asked how it works, and it explained the app"
+
+Reported: *"1st I asked about FSSAI and 2nd time I asked how it works but it is not telling
+about FSSAI, instead it is telling how the app works. I think it is not storing the
+information it talks about."*
+
+That diagnosis was right. The turns **were** stored (Round 3), but the **subject** of the
+conversation never was.
+
+## 26. Root cause: a pronoun with no antecedent
+
+- `analyzeCustomerWords` extracted complaint fields (place / when / cause / food item) —
+  useful for a grievance, useless for a question. Nothing recorded *what the conversation
+  was about*.
+- The prompt had a facts ledger and a transcript, but no statement of the current subject.
+  Faced with "how does it work?", the model resolved "it" to the only salient thing it could
+  see — itself — and explained the app.
+- The seeded `qa_cache` FSSAI rows (`definition_fssai`, `working_fssai`) were written at
+  startup and then **never read** by `/api/chat`; only `knowledge_base` rows were, and only
+  as optional context.
+
+## 27. Fix — an explicit, persisted topic ledger
+
+`TOPIC_LIBRARY` in [server.ts](server.ts) holds seven subjects — `fssai`, `licence`,
+`complaint`, `hygiene`, `penalty`, `packaged`, `app` — each with multilingual patterns and
+short reference text (definition / how it works / more detail) in English, Hindi and Kannada.
+
+- `detectTopics()` returns topics in **order of mention position**, so "how does the FSSAI
+  licence work" resolves to licensing rather than to FSSAI.
+- `deriveTopicState()` walks every stored user turn; the **last** topic mentioned is the
+  `current` one. That is how people actually talk: *what is FSSAI? → how does it work?*
+- The topic list is persisted in the existing `conversations.facts` column as JSON, so no
+  migration is needed, and it is returned on every `/api/chat` response.
+
+## 28. Fix — follow-ups are resolved, not guessed
+
+`resolveGroundedTopicAnswer()` handles three cases from the reference text:
+
+| Utterance | Resolved as |
+|---|---|
+| "how does it work", "how it works", "ಅದು ಹೇಗೆ", "यह कैसे काम करता है" | `works` of the current topic |
+| "why?", "tell me more", "ಇನ್ನಷ್ಟು", "और बताओ" | `more` of the current topic |
+| "what is FSSAI", "how do I register a complaint?" (an explicitly named topic) | that topic |
+
+Guards, so it cannot hijack a real complaint or return a near-miss answer:
+
+- **Incident vocabulary** (worm, stale, vomiting, ಕೂದಲು, कीड़ा …) → not a FAQ; the normal
+  complaint path handles it.
+- **Detail questions** (fee, cost, documents, renewal, how long …) → not a short definition;
+  the model answers with the reference attached.
+- **No topic at all** → no grounded answer; the prompt tells the model to ask what "it"
+  refers to instead of inventing one.
+- Asking about the app still works — but only when the caller actually says *app / website /
+  chatbot / "how do you work"*.
+
+## 29. Fix — the prompt now states the subject
+
+A `CURRENT TOPIC` block sits in the system prompt with the reference text and three rules:
+a follow-up refers to the current topic; **never explain this app unless explicitly asked**;
+a new subject replaces the old one.
+
+## 30. Fix — the browser remembers too
+
+`localStorage["vox_memory_v1"]` now holds the recent turns **and the topic list** alongside
+the conversation id. On load the chat is restored from it, and every request sends
+`clientTopics`, so a restarted (or serverless) instance still knows what was being discussed.
+"New conversation" clears it.
+
+## 31. Content correction found while writing the reference
+
+Licence thresholds in this project's own text were the pre-2026 ones. The FSSAI order
+effective **1 April 2026** replaced them: registration up to **₹1.5 crore** turnover, State
+licence **₹1.5–50 crore**, Central licence **above ₹50 crore**. The reference text uses the
+current thresholds.
+
+## Verification
+
+```
+=== topic memory: 23 passed, 0 failed ===
+PASS  definition names the authority            PASS  topic recorded as fssai
+PASS  follow-up answers about FSSAI, not the app
+PASS  follow-up does NOT describe the app       PASS  follow-up is not a repeat of the definition
+PASS  "tell me more" stays on the same subject
+PASS  Hindi definition + Hindi follow-up + not about the app
+PASS  Kannada definition + Kannada follow-up + not about the app
+PASS  complaint question switches the topic     PASS  follow-up resolves to the NEW topic
+PASS  asking about the app explicitly is answered as such
+PASS  browser topic list resolves the follow-up when the server has no turns
+PASS  with no topic it does not claim to be describing FSSAI
+```
+
+| Check | Result |
+|---|---|
+| `test-topic-memory.mjs` (new, 23 cases) | **23 / 23** |
+| `test-memory-isolation.mjs` | **9 / 9** |
+| `test-recall-intent.mjs` | **14 / 14** |
+| `test-repetition-collapse.ts` | **52 / 52** |
+| `tsc --noEmit` | clean (only the pre-existing `firebase.ts` errors) |
+| `npm run build` | passes (frontend + server bundle) |
+
+## Files changed in this round
+
+| File | Change |
+|---|---|
+| `server.ts` | `TOPIC_LIBRARY`, `detectTopics`, `normalizeTopicList`, `deriveTopicState`, `resolveFollowUpIntent`, `resolveGroundedTopicAnswer`, `buildTopicBlock`; topics persisted in `conversations.facts`; `CURRENT TOPIC` prompt block + "never explain the app" rule; `topic`/`topics` returned by `/api/chat` |
+| `src/components/VoiceAssistant.tsx` | `vox_memory_v1` browser memory (turns + topics), restore on load, `clientTopics` sent per request, cleared on New conversation |
+| `test-topic-memory.mjs` | **New** — 23-case topic-memory suite |
+
+## Still open, stated plainly
+
+- Topics are **keyword-based**. A subject outside the library is not tracked; the model still
+  answers, and it now at least knows that no topic is established rather than assuming it is
+  the subject.
+- The FSSAI contact details in the reference text (helpline, complaints email, Food Safety
+  Connect) come from published sources, not from the app's own uploaded knowledge base —
+  confirm them against fssai.gov.in before going live, and they belong in an admin upload.
