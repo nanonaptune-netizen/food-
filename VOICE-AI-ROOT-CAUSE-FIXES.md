@@ -810,3 +810,99 @@ PASS  with no topic it does not claim to be describing FSSAI
 - The FSSAI contact details in the reference text (helpline, complaints email, Food Safety
   Connect) come from published sources, not from the app's own uploaded knowledge base —
   confirm them against fssai.gov.in before going live, and they belong in an admin upload.
+
+---
+
+# Round 8 — "Kannada is understood well, but the caption is improper Kannada"
+
+Reported: *"I'm saying something, it understands well but not in caption — Kannada,
+unrelated, improper Kannada is displaying."*
+
+Exactly right, and it is a **two-source** problem: the text that reached the model and the
+text on screen did not come from the same place.
+
+## 32. Root cause: Whisper was answering, Chrome was captioning
+
+- The dispatcher used **server Whisper** (`/api/stt`) on the recorded audio — forced to
+  `kn`, seeded with a Kannada lexicon. That is why the *answer* was correct.
+- The on-screen caption (`transcript` state) was written by **`recognition.onresult`**, i.e.
+  Chrome's own `SpeechRecognition`. Desktop Chrome **silently ignores
+  `recognition.lang = 'kn-IN'`**, so it transcribes Kannada audio with a mismatched
+  acoustic model and returns words that have nothing to do with what was said.
+- Round 3 had already made Whisper the source of truth for the *dispatched* text, but the
+  live preview was left playing into the caption — so the screen kept showing Chrome's
+  guess.
+
+## 33. Second leak, found while reading the same function
+
+`stopListeningAndSend()` computed:
+
+```js
+const rawFinal = serverText && serverText.trim() && !isHallucinatedText(serverText.trim())
+  ? serverText.trim()
+  : browserCaptured;          // <-- Chrome's guess, for a Kannada caller
+```
+
+So whenever Whisper returned nothing usable (quota, timeout, hallucination filter), the
+browser's unrelated text became the caller's **message** too — not just the caption.
+
+## 34. Fix — one rule, one function
+
+`chooseCaption(whisperText, browserText, language)` in [src/utils/text.ts](src/utils/text.ts):
+
+| Situation | Result |
+|---|---|
+| Whisper returned text | **Whisper wins**, always (any language) |
+| Whisper empty, language is Kannada/Hindi | **empty** — the browser guess is discarded |
+| Whisper empty, language is English | browser text, if it passes the script check |
+| Whisper empty, browser text in the wrong script | empty |
+
+Supporting rules, also in `text.ts`: `browserPreviewIsTrustworthy()` (English only) and
+`matchesSelectedScript()` (Kannada `U+0C80–U+0CFF`, Hindi `U+0900–U+097F`).
+
+Consequences in the component:
+
+- `recognition.onresult` no longer writes the preview into the caption for Kannada/Hindi. The
+  buffer is still used for **barge-in**, but it is never displayed and never sent.
+- The caption now shows a real, localized state sequence:
+  `ಆಲಿಸುತ್ತಿದ್ದೇನೆ… ದಯವಿಟ್ಟು ಮಾತನಾಡಿ` → `ನಿಮ್ಮ ಧ್ವನಿ ಅರ್ಥೈಸುತ್ತಿದ್ದೇನೆ…` → the actual Whisper
+  transcript. Same in Hindi and English.
+- If nothing usable was heard at all, it says so in the caller's language
+  (`ನನಗೆ ಅರ್ಥವಾಗಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಮತ್ತೊಮ್ಮೆ ಹೇಳಿ.`) instead of presenting a guess as their words.
+
+## 35. The trade-off, stated plainly
+
+Kannada captions are now **correct but not word-by-word live** — they appear when Whisper
+returns, roughly 1–2 s after you stop speaking. Chrome cannot produce a real-time Kannada
+transcript; that is the reason the caption was wrong. True live Indic captions would need a
+streaming STT provider (word-level partials), which is a separate, paid integration.
+
+## Verification
+
+```
+=== caption language: 30 passed, 0 failed ===
+PASS  English browser preview is trusted
+PASS  Kannada browser preview is NOT trusted      PASS  Hindi browser preview is NOT trusted
+PASS  Kannada text matches Kannada                PASS  Kannada text does NOT match Hindi
+PASS  Hindi text matches Hindi                    PASS  English text matches English
+PASS  caption uses the Whisper text               PASS  caption is proper Kannada
+PASS  browser text never appears in the caption
+PASS  Kannada: no browser fallback                PASS  Hindi: no browser fallback
+PASS  English: browser fallback is allowed        PASS  English: non-Latin fallback rejected
+PASS  all three hint sets present and in the right script
+```
+
+| Check | Result |
+|---|---|
+| `test-caption-language.ts` (new, 30 cases) | **30 / 30** |
+| `test-repetition-collapse.ts` | **52 / 52** |
+| `tsc --noEmit` | clean (only the pre-existing `firebase.ts` errors) |
+| `npm run build` | passes (frontend + server bundle) |
+
+## Files changed in this round
+
+| File | Change |
+|---|---|
+| `src/utils/text.ts` | `chooseCaption()`, `browserPreviewIsTrustworthy()`, `matchesSelectedScript()`, localized `LISTENING_HINT` / `RECOGNISING_HINT` / `REPEAT_HINT` |
+| `src/components/VoiceAssistant.tsx` | browser preview no longer captions Kannada/Hindi; Whisper-only fallback rule at both transcription exits; localized caption placeholders |
+| `test-caption-language.ts` | **New** — 30-case caption-language suite |

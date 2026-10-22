@@ -6,7 +6,20 @@ import { VoiceInteraction, UserProfile } from '../types';
 import ParticleBall from './ParticleBall';
 import { RenderedMarkdown } from './RenderedMarkdown';
 import { transcribeAudioInBrowser } from '../lib/clientWhisper';
-import { stripEmojis, cleanSpeechTranscript, mergeTranscripts, isAffirmation, collapseRepetitions, normalizeRecognizedText } from '../utils/text';
+import {
+  stripEmojis,
+  cleanSpeechTranscript,
+  mergeTranscripts,
+  isAffirmation,
+  collapseRepetitions,
+  normalizeRecognizedText,
+  browserPreviewIsTrustworthy,
+  matchesSelectedScript,
+  chooseCaption,
+  LISTENING_HINT,
+  RECOGNISING_HINT,
+  REPEAT_HINT,
+} from '../utils/text';
 
 // ---------------------------------------------------------------------------
 // Browser memory
@@ -583,8 +596,15 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
           accumulatedFinalRef.current = combined;
 
           if (combined) {
-            transcriptRef.current = combined;
-            setTranscript(combined);
+            // The live caption is only previewed for English. For Kannada/Hindi
+            // this text is Chrome's guess with an ignored `lang`, i.e. the
+            // unrelated "improper Kannada" that was appearing on screen. The
+            // buffer is still kept for barge-in, but it is never displayed and
+            // never sent as the caller's words.
+            if (browserPreviewIsTrustworthy(language)) {
+              transcriptRef.current = combined;
+              setTranscript(combined);
+            }
             hasSpokenRef.current = true;
             lastSoundTimeRef.current = Date.now();
 
@@ -870,7 +890,7 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     // of truth for both the caption and the dispatched text.
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       setIsLoading(true);
-      setTranscript('Recognising your speech...');
+      setTranscript(RECOGNISING_HINT[language] || RECOGNISING_HINT.English);
       const serverText = await stopAndTranscribeAudio();
       setIsLoading(false);
 
@@ -879,9 +899,13 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
       // the recogniser produced went straight into the caption, the chat message
       // and the LLM prompt. Every path now goes through the same collapsing
       // (near-exact repeated copies included) before anything is shown or sent.
-      const rawFinal = serverText && serverText.trim() && !isHallucinatedText(serverText.trim())
+      // Only English may fall back to the browser's text. Doing that for Kannada
+      // is what replaced a good server transcript with unrelated words whenever
+      // Whisper returned nothing usable.
+      const usableServerText = serverText && serverText.trim() && !isHallucinatedText(serverText.trim())
         ? serverText.trim()
-        : browserCaptured;
+        : '';
+      const rawFinal = chooseCaption(usableServerText, browserCaptured, language);
       // Collapse repeats, then repair digit homophones ("I 8 food" -> "I ate food")
       // before it becomes the caption, the chat message or memory.
       const finalText = normalizeRecognizedText(collapseRepetitions(rawFinal)).trim();
@@ -893,7 +917,9 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
         // second transcription path as well).
         handleSendMessage(finalText);
       } else {
-        setTranscript('');
+        // Nothing usable from either engine: say so, rather than displaying
+        // the browser's unrelated guess as if it were what the caller said.
+        setTranscript(REPEAT_HINT[language] || REPEAT_HINT.English);
       }
       return;
     }
@@ -903,8 +929,13 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     // from: Chrome replays the same audio across its silent end/restart cycles and
     // re-transcribes it slightly differently, so the same phrase accumulated. It
     // is collapsed here too, so no path can emit repetition.
-    const fallbackText = normalizeRecognizedText(collapseRepetitions(browserCaptured)).trim();
-    if (fallbackText && !isHallucinatedText(fallbackText)) {
+    // ...and only for English. For Kannada/Hindi the browser text is rejected on
+    // script grounds even here, so a mismatched model can never become the
+    // caller's message.
+    const fallbackText = normalizeRecognizedText(
+      collapseRepetitions(chooseCaption('', browserCaptured, language))
+    ).trim();
+    if (fallbackText && !isHallucinatedText(fallbackText) && matchesSelectedScript(fallbackText, language)) {
       setTranscript(fallbackText);
       transcriptRef.current = '';
       handleSendMessage(fallbackText);
@@ -912,7 +943,7 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
     }
 
     transcriptRef.current = '';
-    setTranscript('');
+    setTranscript(REPEAT_HINT[language] || REPEAT_HINT.English);
   };
 
   // One shared microphone stream feeds the orb visualiser. It is opened once and
@@ -1416,7 +1447,7 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
                     >
                       {transcript || (
                         isListening 
-                          ? "Listening... Speak your query clearly" 
+                          ? (LISTENING_HINT[language] || LISTENING_HINT.English)
                           : ""
                       )}
                     </motion.p>
@@ -1467,7 +1498,7 @@ export default function VoiceAssistant({ profile }: { profile: UserProfile }) {
                   <p className="text-[10px] text-white/90 font-bold truncate max-w-[110px] sm:max-w-[150px]">
                     {transcript || (
                       isListening 
-                        ? "Listening..." 
+                        ? (LISTENING_HINT[language] || LISTENING_HINT.English)
                         : isSpeaking 
                         ? "Speaking..." 
                         : isLoading 

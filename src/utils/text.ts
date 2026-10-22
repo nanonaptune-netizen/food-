@@ -264,3 +264,68 @@ export function mergeTranscripts(prefix: string, newText: string): string {
   return cleanSpeechTranscript(merged);
 }
 
+// ---------------------------------------------------------------------------
+// Live-caption trust rules
+//
+// ROOT CAUSE of "it understands me, but the caption shows improper/unrelated
+// Kannada": the transcription that reached the model came from Whisper (correct),
+// while the caption on screen came from Chrome's own SpeechRecognition.
+// Desktop Chrome silently ignores `recognition.lang = 'kn-IN'` (and hi-IN on many
+// Windows builds), so it transcribes Kannada audio with the wrong acoustic model
+// and returns words that have nothing to do with what was said.
+//
+// The rule is therefore: the browser recogniser may only be shown, or used as a
+// fallback, for English. Kannada and Hindi captions come from the server
+// transcript and nothing else.
+// ---------------------------------------------------------------------------
+
+export function browserPreviewIsTrustworthy(language: string): boolean {
+  return language === 'English';
+}
+
+/** Does this text actually use the script of the language the caller selected? */
+export function matchesSelectedScript(text: string, language: string): boolean {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  if (language === 'Kannada') return /[\u0C80-\u0CFF]/.test(value);
+  if (language === 'Hindi') return /[\u0900-\u097F]/.test(value);
+  return /[A-Za-z]/.test(value);
+}
+
+/**
+ * Which text should be shown/sent as the caller's words?
+ *
+ * The server transcript (Whisper) always wins when it exists, because it is the
+ * one that actually understood the speech. The browser text is only a fallback,
+ * and only for English - otherwise Chrome's mismatched Indic model would replace
+ * a correct sentence with unrelated words.
+ */
+export function chooseCaption(whisperText: string, browserText: string, language: string): string {
+  const whisper = String(whisperText || '').trim();
+  if (whisper) return whisper;
+  if (!browserPreviewIsTrustworthy(language)) return '';
+  const browser = String(browserText || '').trim();
+  return matchesSelectedScript(browser, language) ? browser : '';
+}
+
+/** Caption strings, so a Kannada caller is never shown an English placeholder. */
+export const LISTENING_HINT: Record<string, string> = {
+  English: 'Listening… speak naturally',
+  Hindi: 'सुन रहा हूँ… कृपया बोलिए',
+  Kannada: 'ಆಲಿಸುತ್ತಿದ್ದೇನೆ… ದಯವಿಟ್ಟು ಮಾತನಾಡಿ',
+};
+
+export const RECOGNISING_HINT: Record<string, string> = {
+  English: 'Recognising your speech…',
+  Hindi: 'आपकी आवाज़ समझ रहा हूँ…',
+  Kannada: 'ನಿಮ್ಮ ಧ್ವನಿ ಅರ್ಥೈಸುತ್ತಿದ್ದೇನೆ…',
+};
+
+export const REPEAT_HINT: Record<string, string> = {
+  English: "I didn't catch that. Please say it again.",
+  Hindi: 'मैं समझ नहीं पाया। कृपया दोबारा कहिए।',
+  Kannada: 'ನನಗೆ ಅರ್ಥವಾಗಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಮತ್ತೊಮ್ಮೆ ಹೇಳಿ.',
+};
+
+
+
